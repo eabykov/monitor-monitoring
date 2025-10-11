@@ -17,13 +17,44 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const (
-	checkInterval     = 1 * time.Minute
-	requestTimeout    = 45 * time.Second
-	retryDelay        = 5 * time.Second
-	failureThreshold  = 3
-	notifyBatchWindow = 10 * time.Second
-)
+type MonitorConfig struct {
+	checkInterval     time.Duration
+	requestTimeout    time.Duration
+	retryDelay        time.Duration
+	failureThreshold  int
+	notifyBatchWindow time.Duration
+}
+
+func loadMonitorConfig() MonitorConfig {
+	return MonitorConfig{
+		checkInterval:     getEnvDuration("CHECK_INTERVAL", 1*time.Minute),
+		requestTimeout:    getEnvDuration("REQUEST_TIMEOUT", 45*time.Second),
+		retryDelay:        getEnvDuration("RETRY_DELAY", 5*time.Second),
+		failureThreshold:  getEnvInt("FAILURE_THRESHOLD", 3),
+		notifyBatchWindow: getEnvDuration("NOTIFY_BATCH_WINDOW", 10*time.Second),
+	}
+}
+
+func getEnvDuration(key string, defaultVal time.Duration) time.Duration {
+	if val := os.Getenv(key); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			return d
+		}
+		log.Printf("WARN: invalid duration for %s=%s, using default %v", key, val, defaultVal)
+	}
+	return defaultVal
+}
+
+func getEnvInt(key string, defaultVal int) int {
+	if val := os.Getenv(key); val != "" {
+		var i int
+		if _, err := fmt.Sscanf(val, "%d", &i); err == nil && i > 0 {
+			return i
+		}
+		log.Printf("WARN: invalid integer for %s=%s, using default %d", key, val, defaultVal)
+	}
+	return defaultVal
+}
 
 type Config struct {
 	Endpoints []Endpoint `yaml:"endpoints"`
@@ -46,6 +77,7 @@ type ServiceState struct {
 
 type Monitor struct {
 	config         Config
+	monitorConfig  MonitorConfig
 	states         map[string]*ServiceState
 	statesMu       sync.RWMutex
 	telegramToken  string
@@ -105,14 +137,23 @@ func run() error {
 			func() int { if ep.ExpectedStatus != 0 { return ep.ExpectedStatus }; return 200 }())
 	}
 
+	monitorConfig := loadMonitorConfig()
+	log.Printf("INFO: Monitor configuration:")
+	log.Printf("  Check interval: %v", monitorConfig.checkInterval)
+	log.Printf("  Request timeout: %v", monitorConfig.requestTimeout)
+	log.Printf("  Retry delay: %v", monitorConfig.retryDelay)
+	log.Printf("  Failure threshold: %d", monitorConfig.failureThreshold)
+	log.Printf("  Notify batch window: %v", monitorConfig.notifyBatchWindow)
+
 	monitor := &Monitor{
 		config:         config,
+		monitorConfig:  monitorConfig,
 		states:         make(map[string]*ServiceState),
 		telegramToken:  telegramToken,
 		telegramChatID: telegramChatID,
 		mattermostURL:  mattermostURL,
 		httpClient: &http.Client{
-			Timeout: requestTimeout,
+			Timeout: monitorConfig.requestTimeout,
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 10,
@@ -135,13 +176,13 @@ func run() error {
 	monitor.wg.Add(1)
 	go monitor.notificationWorker(ctx)
 
-	log.Printf("INFO: Starting service monitor, checking every %v", checkInterval)
+	log.Printf("INFO: Starting service monitor, checking every %v", monitorConfig.checkInterval)
 	log.Printf("INFO: Telegram notifications enabled for chat %s", telegramChatID)
 	if mattermostURL != "" {
 		log.Printf("INFO: Mattermost fallback enabled")
 	}
 
-	ticker := time.NewTicker(checkInterval)
+	ticker := time.NewTicker(monitorConfig.checkInterval)
 	defer ticker.Stop()
 
 	log.Println("INFO: Running initial health check...")
@@ -185,7 +226,7 @@ func (m *Monitor) checkService(ctx context.Context, ep Endpoint) {
 	success := m.performCheck(ctx, ep)
 
 	if !success {
-		time.Sleep(retryDelay)
+		time.Sleep(m.monitorConfig.retryDelay)
 		success = m.performCheck(ctx, ep)
 	}
 
@@ -265,7 +306,7 @@ func (m *Monitor) updateState(url string, success bool) {
 			state.firstFailTime = now
 		}
 
-		if state.consecutiveFails >= failureThreshold && !state.isDown {
+		if state.consecutiveFails >= m.monitorConfig.failureThreshold && !state.isDown {
 			state.isDown = true
 			m.notifyQueue <- NotifyEvent{
 				endpoint:  url,
@@ -281,7 +322,7 @@ func (m *Monitor) notificationWorker(ctx context.Context) {
 	defer m.wg.Done()
 
 	var batch []NotifyEvent
-	timer := time.NewTimer(notifyBatchWindow)
+	timer := time.NewTimer(m.monitorConfig.notifyBatchWindow)
 	timer.Stop()
 
 	for {
@@ -289,7 +330,7 @@ func (m *Monitor) notificationWorker(ctx context.Context) {
 		case event := <-m.notifyQueue:
 			batch = append(batch, event)
 			if len(batch) == 1 {
-				timer.Reset(notifyBatchWindow)
+				timer.Reset(m.monitorConfig.notifyBatchWindow)
 			}
 		case <-timer.C:
 			if len(batch) > 0 {
