@@ -161,4 +161,3 @@ MIT © [eabykov](https://github.com/eabykov)
 |-|-|
 | 🐛 Issues | https://github.com/eabykov/monitor-monitoring/issues |
 | 💬 Discussions | https://github.com/eabykov/monitor-monitoring/discussions |
-```
