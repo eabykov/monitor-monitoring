@@ -1,0 +1,51 @@
+endpoints:
+  # Mattermost
+  - url: https://mattermost.company.com/api/v4/system/ping
+    method: GET
+    expected_status: 200
+
+  # Grafana
+  - url: https://grafana.company.com/api/health
+    method: GET
+    expected_status: 200
+
+  # VictoriaMetrics
+  - url: https://victoria.company.com/health
+    method: GET
+    expected_status: 200
+
+  # Kubernetes API
+  - url: https://k8s.company.com/healthz
+    method: GET
+    expected_status: 200
+    headers:
+      Authorization: "Bearer your-k8s-token"
+
+  # Redmine
+  - url: https://redmine.company.com
+    method: GET
+    expected_status: 200
+
+  # Confluence
+  - url: https://confluence.company.com/status
+    method: GET
+    expected_status: 200
+
+  # VPN Gateway
+  - url: https://vpn.company.com/health
+    method: GET
+    expected_status: 200
+
+  # Custom API with authentication
+  - url: https://api.company.com/v1/health
+    method: GET
+    expected_status: 200
+    headers:
+      X-API-Key: "your-api-key"
+      User-Agent: "ServiceMonitor/1.0"
+
+  # Service with POST check
+  - url: https://service.company.com/healthcheck
+    method: POST
+    expected_status: 204
+
