@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -40,7 +40,8 @@ func getEnvDuration(key string, defaultVal time.Duration) time.Duration {
 		if d, err := time.ParseDuration(val); err == nil {
 			return d
 		}
-		log.Printf("WARN: invalid duration for %s=%s, using default %v", key, val, defaultVal)
+		slog.Warn("invalid duration, using default",
+			"key", key, "value", val, "default", defaultVal)
 	}
 	return defaultVal
 }
@@ -51,7 +52,8 @@ func getEnvInt(key string, defaultVal int) int {
 		if _, err := fmt.Sscanf(val, "%d", &i); err == nil && i > 0 {
 			return i
 		}
-		log.Printf("WARN: invalid integer for %s=%s, using default %d", key, val, defaultVal)
+		slog.Warn("invalid integer, using default",
+			"key", key, "value", val, "default", defaultVal)
 	}
 	return defaultVal
 }
@@ -96,8 +98,14 @@ type NotifyEvent struct {
 }
 
 func main() {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
 	if err := run(); err != nil {
-		log.Fatalf("FATAL: %v", err)
+		slog.Error("fatal error", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -129,21 +137,29 @@ func run() error {
 		return fmt.Errorf("no endpoints configured")
 	}
 
-	log.Printf("INFO: Loaded configuration with %d endpoints", len(config.Endpoints))
+	slog.Info("loaded configuration", "endpoints", len(config.Endpoints))
 	for _, ep := range config.Endpoints {
-		log.Printf("INFO: Monitoring %s [%s, expected: %d]", 
-			ep.URL, 
-			func() string { if ep.Method != "" { return ep.Method }; return "GET" }(),
-			func() int { if ep.ExpectedStatus != 0 { return ep.ExpectedStatus }; return 200 }())
+		method := ep.Method
+		if method == "" {
+			method = "GET"
+		}
+		expectedStatus := ep.ExpectedStatus
+		if expectedStatus == 0 {
+			expectedStatus = 200
+		}
+		slog.Info("monitoring endpoint",
+			"url", ep.URL,
+			"method", method,
+			"expected_status", expectedStatus)
 	}
 
 	monitorConfig := loadMonitorConfig()
-	log.Printf("INFO: Monitor configuration:")
-	log.Printf("  Check interval: %v", monitorConfig.checkInterval)
-	log.Printf("  Request timeout: %v", monitorConfig.requestTimeout)
-	log.Printf("  Retry delay: %v", monitorConfig.retryDelay)
-	log.Printf("  Failure threshold: %d", monitorConfig.failureThreshold)
-	log.Printf("  Notify batch window: %v", monitorConfig.notifyBatchWindow)
+	slog.Info("monitor configuration",
+		"check_interval", monitorConfig.checkInterval,
+		"request_timeout", monitorConfig.requestTimeout,
+		"retry_delay", monitorConfig.retryDelay,
+		"failure_threshold", monitorConfig.failureThreshold,
+		"notify_batch_window", monitorConfig.notifyBatchWindow)
 
 	monitor := &Monitor{
 		config:         config,
@@ -167,40 +183,35 @@ func run() error {
 		monitor.states[ep.URL] = &ServiceState{}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	monitor.wg.Add(1)
 	go monitor.notificationWorker(ctx)
 
-	log.Printf("INFO: Starting service monitor, checking every %v", monitorConfig.checkInterval)
-	log.Printf("INFO: Telegram notifications enabled for chat %s", telegramChatID)
+	slog.Info("starting service monitor",
+		"interval", monitorConfig.checkInterval,
+		"chat_id", telegramChatID)
 	if mattermostURL != "" {
-		log.Printf("INFO: Mattermost fallback enabled")
+		slog.Info("mattermost fallback enabled")
 	}
 
 	ticker := time.NewTicker(monitorConfig.checkInterval)
 	defer ticker.Stop()
 
-	log.Println("INFO: Running initial health check...")
+	slog.Info("running initial health check")
 	monitor.checkAllServices(ctx)
-	log.Println("INFO: Initial check completed")
+	slog.Info("initial check completed")
 
 	for {
 		select {
 		case <-ticker.C:
 			monitor.checkAllServices(ctx)
-		case <-sigChan:
-			log.Println("INFO: Received shutdown signal, stopping gracefully...")
-			cancel()
-			monitor.wg.Wait()
-			log.Println("INFO: Shutdown complete")
-			return nil
 		case <-ctx.Done():
+			slog.Info("received shutdown signal, stopping gracefully")
+			close(monitor.notifyQueue)
 			monitor.wg.Wait()
+			slog.Info("shutdown complete")
 			return nil
 		}
 	}
@@ -218,7 +229,7 @@ func (m *Monitor) checkAllServices(ctx context.Context) {
 	}
 	wg.Wait()
 	duration := time.Since(startTime)
-	log.Printf("INFO: Health check cycle completed in %v", duration.Round(time.Millisecond))
+	slog.Info("health check cycle completed", "duration", duration.Round(time.Millisecond))
 }
 
 func (m *Monitor) checkService(ctx context.Context, ep Endpoint) {
@@ -247,7 +258,7 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 	startTime := time.Now()
 	req, err := http.NewRequestWithContext(ctx, method, ep.URL, nil)
 	if err != nil {
-		log.Printf("ERROR: failed to create request for %s: %v", ep.URL, err)
+		slog.Error("failed to create request", "url", ep.URL, "error", err)
 		return false
 	}
 
@@ -257,21 +268,26 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
-		log.Printf("WARN: request failed for %s: %v", ep.URL, err)
+		slog.Warn("request failed", "url", ep.URL, "error", err)
 		return false
 	}
 	defer resp.Body.Close()
 
-	io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != expectedStatus {
-		log.Printf("WARN: unexpected status %d (expected %d) for %s", 
-			resp.StatusCode, expectedStatus, ep.URL)
+		slog.Warn("unexpected status",
+			"url", ep.URL,
+			"status", resp.StatusCode,
+			"expected", expectedStatus)
 		return false
 	}
 
 	duration := time.Since(startTime)
-	log.Printf("INFO: ✓ %s [%d] %v", ep.URL, resp.StatusCode, duration.Round(time.Millisecond))
+	slog.Info("check successful",
+		"url", ep.URL,
+		"status", resp.StatusCode,
+		"duration", duration.Round(time.Millisecond))
 	return true
 }
 
@@ -327,7 +343,13 @@ func (m *Monitor) notificationWorker(ctx context.Context) {
 
 	for {
 		select {
-		case event := <-m.notifyQueue:
+		case event, ok := <-m.notifyQueue:
+			if !ok {
+				if len(batch) > 0 {
+					m.sendBatchNotification(batch)
+				}
+				return
+			}
 			batch = append(batch, event)
 			if len(batch) == 1 {
 				timer.Reset(m.monitorConfig.notifyBatchWindow)
@@ -369,7 +391,7 @@ func (m *Monitor) sendBatchNotification(events []NotifyEvent) {
 	if len(downServices) > 0 {
 		msg += "🔴 *Services DOWN:*\n"
 		for _, svc := range downServices {
-			msg += fmt.Sprintf("• %s\n  Failed at: %s\n", 
+			msg += fmt.Sprintf("• %s\n  Failed at: %s\n",
 				svc, downDetails[svc].Format("2006-01-02 15:04:05"))
 		}
 	}
@@ -390,7 +412,7 @@ func (m *Monitor) sendBatchNotification(events []NotifyEvent) {
 		if m.mattermostURL != "" {
 			m.sendToMattermost(msg)
 		} else {
-			log.Printf("ERROR: failed to send notifications, no fallback configured")
+			slog.Error("failed to send notifications, no fallback configured")
 		}
 	}
 }
@@ -406,7 +428,7 @@ func (m *Monitor) sendToTelegram(message string) bool {
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("ERROR: failed to marshal telegram payload: %v", err)
+		slog.Error("failed to marshal telegram payload", "error", err)
 		return false
 	}
 
@@ -415,25 +437,25 @@ func (m *Monitor) sendToTelegram(message string) bool {
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
-		log.Printf("ERROR: failed to create telegram request: %v", err)
+		slog.Error("failed to create telegram request", "error", err)
 		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
-		log.Printf("WARN: telegram request failed: %v", err)
+		slog.Warn("telegram request failed", "error", err)
 		return false
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != 200 {
-		log.Printf("WARN: telegram returned status %d", resp.StatusCode)
+		slog.Warn("telegram returned non-200 status", "status", resp.StatusCode)
 		return false
 	}
 
-	log.Println("INFO: Notification sent to Telegram")
+	slog.Info("notification sent to Telegram")
 	return true
 }
 
@@ -444,7 +466,7 @@ func (m *Monitor) sendToMattermost(message string) {
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("ERROR: failed to marshal mattermost payload: %v", err)
+		slog.Error("failed to marshal mattermost payload", "error", err)
 		return
 	}
 
@@ -453,23 +475,24 @@ func (m *Monitor) sendToMattermost(message string) {
 
 	req, err := http.NewRequestWithContext(ctx, "POST", m.mattermostURL, bytes.NewReader(body))
 	if err != nil {
-		log.Printf("ERROR: failed to create mattermost request: %v", err)
+		slog.Error("failed to create mattermost request", "error", err)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
-		log.Printf("ERROR: mattermost request failed: %v", err)
+		slog.Error("mattermost request failed", "error", err)
 		return
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != 200 {
-		log.Printf("ERROR: mattermost returned status %d", resp.StatusCode)
+		slog.Error("mattermost returned non-200 status", "status", resp.StatusCode)
 		return
 	}
 
-	log.Println("INFO: Notification sent to Mattermost (fallback)")
+	slog.Info("notification sent to Mattermost (fallback)")
 }
+
