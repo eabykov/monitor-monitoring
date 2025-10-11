@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
@@ -22,14 +23,14 @@ import (
 
 // MonitorConfig содержит конфигурацию мониторинга
 type MonitorConfig struct {
-	checkInterval      time.Duration
-	requestTimeout     time.Duration
-	retryDelay         time.Duration
-	failureThreshold   int
-	notifyBatchWindow  time.Duration
-	maxBatchSize       int
-	maxConcurrentChecks int    // новое: ограничение конкурентности
-	maxResponseBodySize int64  // новое: лимит размера тела ответа
+	checkInterval       time.Duration
+	requestTimeout      time.Duration
+	retryDelay          time.Duration
+	failureThreshold    int
+	notifyBatchWindow   time.Duration
+	maxBatchSize        int
+	maxConcurrentChecks int
+	maxResponseBodySize int64
 }
 
 func loadMonitorConfig() MonitorConfig {
@@ -40,8 +41,8 @@ func loadMonitorConfig() MonitorConfig {
 		failureThreshold:    getEnvInt("FAILURE_THRESHOLD", 3),
 		notifyBatchWindow:   getEnvDuration("NOTIFY_BATCH_WINDOW", 10*time.Second),
 		maxBatchSize:        getEnvInt("MAX_BATCH_SIZE", 50),
-		maxConcurrentChecks: getEnvInt("MAX_CONCURRENT_CHECKS", 10), // увеличено для баланса
-		maxResponseBodySize: int64(getEnvInt("MAX_RESPONSE_BODY_SIZE", 1048576)), // 1MB default
+		maxConcurrentChecks: getEnvInt("MAX_CONCURRENT_CHECKS", 10),
+		maxResponseBodySize: int64(getEnvInt("MAX_RESPONSE_BODY_SIZE", 1048576)), // 1MB
 	}
 }
 
@@ -51,7 +52,7 @@ func getEnvDuration(key string, defaultVal time.Duration) time.Duration {
 			return d
 		}
 		slog.Warn("invalid duration, using default",
-			"key", key, "value", val, "default", defaultVal)
+			"key", key, "default", defaultVal)
 	}
 	return defaultVal
 }
@@ -63,7 +64,7 @@ func getEnvInt(key string, defaultVal int) int {
 			return i
 		}
 		slog.Warn("invalid integer, using default",
-			"key", key, "value", val, "default", defaultVal)
+			"key", key, "default", defaultVal)
 	}
 	return defaultVal
 }
@@ -79,9 +80,9 @@ type Endpoint struct {
 	Headers        map[string]string `yaml:"headers,omitempty"`
 }
 
-// ServiceState использует минимум памяти
+// ServiceState использует RWMutex для оптимизации чтения
 type ServiceState struct {
-	mu               sync.Mutex // вернули обычный Mutex - он легче RWMutex
+	mu               sync.RWMutex
 	consecutiveFails int
 	isDown           bool
 	firstFailTime    time.Time
@@ -91,18 +92,15 @@ type ServiceState struct {
 type Monitor struct {
 	config         Config
 	monitorConfig  MonitorConfig
-	states         map[string]*ServiceState
+	states         sync.Map
 	telegramToken  string
 	telegramChatID string
 	mattermostURL  string
 	httpClient     *http.Client
-	notifyQueue    chan NotifyEvent
-	semaphore      chan struct{} // семафор для контроля конкурентности
+	notifyQueue    chan *NotifyEvent
+	semaphore      chan struct{}
 	wg             sync.WaitGroup
-	
-	// Пулы для переиспользования объектов
 	eventPool      sync.Pool
-	bufferPool     sync.Pool
 }
 
 type NotifyEvent struct {
@@ -127,13 +125,11 @@ type TelegramNotifier struct {
 
 func (t *TelegramNotifier) Send(ctx context.Context, message string) error {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", t.token)
-
 	payload := map[string]interface{}{
 		"chat_id":    t.chatID,
 		"text":       message,
 		"parse_mode": "Markdown",
 	}
-
 	return sendJSONRequest(ctx, t.httpClient, url, payload)
 }
 
@@ -157,13 +153,13 @@ func (m *MattermostNotifier) Name() string {
 }
 
 // sendJSONRequest унифицированная функция с ограничением размера ответа
-func sendJSONRequest(ctx context.Context, client *http.Client, url string, payload interface{}) error {
+func sendJSONRequest(ctx context.Context, client *http.Client, targetURL string, payload interface{}) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -192,10 +188,91 @@ func sendJSONRequest(ctx context.Context, client *http.Client, url string, paylo
 	return nil
 }
 
+// maskSensitiveString маскирует чувствительные данные для логов
+func maskSensitiveString(s string, showLast int) string {
+	if len(s) <= showLast {
+		return "***"
+	}
+	return strings.Repeat("*", len(s)-showLast) + s[len(s)-showLast:]
+}
+
+// sanitizeURL удаляет query parameters и credentials из URL для безопасного логирования
+func sanitizeURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "[invalid-url]"
+	}
+	parsed.RawQuery = ""
+	parsed.User = nil
+	return parsed.String()
+}
+
+// validateEndpoint валидирует endpoint перед использованием
+func validateEndpoint(ep Endpoint) error {
+	if ep.URL == "" {
+		return errors.New("URL is required")
+	}
+
+	parsed, err := url.Parse(ep.URL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("URL scheme must be http or https, got: %s", parsed.Scheme)
+	}
+
+	if parsed.Host == "" {
+		return errors.New("URL must have a host")
+	}
+
+	// Проверяем метод
+	if ep.Method != "" {
+		method := strings.ToUpper(ep.Method)
+		validMethods := map[string]bool{
+			"GET": true, "POST": true, "PUT": true, "PATCH": true,
+			"DELETE": true, "HEAD": true, "OPTIONS": true,
+		}
+		if !validMethods[method] {
+			return fmt.Errorf("invalid HTTP method: %s", ep.Method)
+		}
+	}
+
+	// Проверяем expected status
+	if ep.ExpectedStatus != 0 && (ep.ExpectedStatus < 100 || ep.ExpectedStatus > 599) {
+		return fmt.Errorf("invalid expected status code: %d", ep.ExpectedStatus)
+	}
+
+	return nil
+}
+
+// sanitizeHeaders создает копию headers с маскированием чувствительных данных
+func sanitizeHeaders(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+
+	sanitized := make(map[string]string, len(headers))
+	sensitiveKeys := map[string]bool{
+		"authorization": true,
+		"x-api-key":     true,
+		"api-key":       true,
+		"token":         true,
+		"secret":        true,
+		"password":      true,
+	}
+
+	for k, v := range headers {
+		if sensitiveKeys[strings.ToLower(k)] {
+			sanitized[k] = "***"
+		} else {
+			sanitized[k] = v
+		}
+	}
+	return sanitized
+}
+
 func main() {
-	// GOMAXPROCS устанавливается через переменную окружения если нужно
-	// По умолчанию Go использует все доступные ядра
-	
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -214,6 +291,19 @@ func run() error {
 
 	if telegramToken == "" || telegramChatID == "" {
 		return errors.New("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
+	}
+
+	// Валидация Telegram token (базовая проверка формата)
+	if !strings.Contains(telegramToken, ":") || len(telegramToken) < 20 {
+		return errors.New("TELEGRAM_BOT_TOKEN appears to be invalid")
+	}
+
+	// Валидация Mattermost webhook URL если задан
+	if mattermostURL != "" {
+		parsed, err := url.Parse(mattermostURL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return fmt.Errorf("MATTERMOST_WEBHOOK_URL is invalid: %w", err)
+		}
 	}
 
 	configPath := "config.yaml"
@@ -235,10 +325,10 @@ func run() error {
 		return errors.New("no endpoints configured")
 	}
 
-	// Валидация эндпоинтов
+	// Валидация всех эндпоинтов
 	for i, ep := range config.Endpoints {
-		if ep.URL == "" {
-			return fmt.Errorf("endpoint %d: URL is required", i)
+		if err := validateEndpoint(ep); err != nil {
+			return fmt.Errorf("endpoint %d validation failed: %w", i, err)
 		}
 	}
 
@@ -252,13 +342,16 @@ func run() error {
 		if expectedStatus == 0 {
 			expectedStatus = http.StatusOK
 		}
+		// Безопасное логирование без query params и credentials
 		slog.Info("monitoring endpoint",
-			"url", ep.URL,
+			"url", sanitizeURL(ep.URL),
 			"method", method,
-			"expected_status", expectedStatus)
+			"expected_status", expectedStatus,
+			"has_custom_headers", len(ep.Headers) > 0)
 	}
 
 	monitorConfig := loadMonitorConfig()
+	// Безопасное логирование - маскируем chat_id
 	slog.Info("monitor configuration",
 		"check_interval", monitorConfig.checkInterval,
 		"request_timeout", monitorConfig.requestTimeout,
@@ -267,19 +360,21 @@ func run() error {
 		"notify_batch_window", monitorConfig.notifyBatchWindow,
 		"max_batch_size", monitorConfig.maxBatchSize,
 		"max_concurrent_checks", monitorConfig.maxConcurrentChecks,
-		"max_response_body_size", monitorConfig.maxResponseBodySize)
+		"max_response_body_size", monitorConfig.maxResponseBodySize,
+		"telegram_chat_id", maskSensitiveString(telegramChatID, 4),
+		"mattermost_enabled", mattermostURL != "")
 
-	// HTTP клиент с агрессивными лимитами для минимизации использования ресурсов
+	// HTTP клиент с оптимизированными параметрами
 	httpClient := &http.Client{
 		Timeout: monitorConfig.requestTimeout,
 		Transport: &http.Transport{
-			MaxIdleConns:          20,  // уменьшено с 100
-			MaxIdleConnsPerHost:   2,   // уменьшено с 10
-			IdleConnTimeout:       30 * time.Second, // уменьшено с 90s
-			MaxConnsPerHost:       5,   // добавлено: ограничение соединений
+			MaxIdleConns:          20,
+			MaxIdleConnsPerHost:   2,
+			IdleConnTimeout:       30 * time.Second,
+			MaxConnsPerHost:       5,
 			DisableKeepAlives:     false,
-			DisableCompression:    false, // оставляем сжатие включенным для совместимости
-			ResponseHeaderTimeout: 10 * time.Second, // таймаут на заголовки
+			DisableCompression:    false,
+			ResponseHeaderTimeout: 10 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
 		},
 	}
@@ -304,27 +399,22 @@ func run() error {
 	monitor := &Monitor{
 		config:         config,
 		monitorConfig:  monitorConfig,
-		states:         make(map[string]*ServiceState, len(config.Endpoints)),
 		telegramToken:  telegramToken,
 		telegramChatID: telegramChatID,
 		mattermostURL:  mattermostURL,
 		httpClient:     httpClient,
-		notifyQueue:    make(chan NotifyEvent, 100),
+		notifyQueue:    make(chan *NotifyEvent, 100),
 		semaphore:      make(chan struct{}, monitorConfig.maxConcurrentChecks),
 		eventPool: sync.Pool{
 			New: func() interface{} {
 				return &NotifyEvent{}
 			},
 		},
-		bufferPool: sync.Pool{
-			New: func() interface{} {
-				return new(bytes.Buffer)
-			},
-		},
 	}
 
+	// Инициализируем состояния в sync.Map
 	for _, ep := range config.Endpoints {
-		monitor.states[ep.URL] = &ServiceState{}
+		monitor.states.Store(ep.URL, &ServiceState{})
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -339,7 +429,6 @@ func run() error {
 
 	slog.Info("starting service monitor",
 		"interval", monitorConfig.checkInterval,
-		"chat_id", telegramChatID,
 		"gomaxprocs", runtime.GOMAXPROCS(0))
 
 	ticker := time.NewTicker(monitorConfig.checkInterval)
@@ -366,12 +455,12 @@ func run() error {
 // memoryMonitor периодически логирует использование памяти
 func (m *Monitor) memoryMonitor(ctx context.Context) {
 	defer m.wg.Done()
-	
+
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-	
+
 	var memStats runtime.MemStats
-	
+
 	for {
 		select {
 		case <-ticker.C:
@@ -381,11 +470,10 @@ func (m *Monitor) memoryMonitor(ctx context.Context) {
 				"sys_mb", memStats.Sys/1024/1024,
 				"num_gc", memStats.NumGC,
 				"goroutines", runtime.NumGoroutine())
-			
-			// Если использование памяти превышает 100MB, принудительно запускаем GC
-			if memStats.Alloc > 100*1024*1024 {
-				slog.Warn("high memory usage detected, forcing GC")
-				runtime.GC()
+
+			// Только предупреждаем при очень высоком использовании (500MB+)
+			if memStats.Alloc > 500*1024*1024 {
+				slog.Warn("high memory usage detected", "alloc_mb", memStats.Alloc/1024/1024)
 			}
 		case <-ctx.Done():
 			return
@@ -400,12 +488,12 @@ func (m *Monitor) checkAllServices(ctx context.Context) {
 
 	var wg sync.WaitGroup
 	startTime := time.Now()
-	
+
 	for _, ep := range m.config.Endpoints {
 		wg.Add(1)
 		go func(endpoint Endpoint) {
 			defer wg.Done()
-			
+
 			// Используем семафор для строгого контроля конкурентности
 			select {
 			case m.semaphore <- struct{}{}:
@@ -417,9 +505,9 @@ func (m *Monitor) checkAllServices(ctx context.Context) {
 		}(ep)
 	}
 	wg.Wait()
-	
+
 	duration := time.Since(startTime)
-	slog.Info("health check cycle completed", "duration", duration.Round(time.Millisecond))
+	slog.Debug("health check cycle completed", "duration", duration.Round(time.Millisecond))
 }
 
 func (m *Monitor) checkService(ctx context.Context, ep Endpoint) {
@@ -434,7 +522,7 @@ func (m *Monitor) checkService(ctx context.Context, ep Endpoint) {
 		// Используем контекст с таймаутом для retry
 		retryCtx, cancel := context.WithTimeout(ctx, m.monitorConfig.retryDelay+m.monitorConfig.requestTimeout)
 		defer cancel()
-		
+
 		time.Sleep(m.monitorConfig.retryDelay)
 		success = m.performCheck(retryCtx, ep)
 	}
@@ -456,7 +544,9 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 	startTime := time.Now()
 	req, err := http.NewRequestWithContext(ctx, method, ep.URL, nil)
 	if err != nil {
-		slog.Error("failed to create request", "url", ep.URL, "error", err)
+		slog.Error("failed to create request",
+			"url", sanitizeURL(ep.URL),
+			"error", err)
 		return false
 	}
 
@@ -470,12 +560,16 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 		if ctx.Err() != nil {
 			return false
 		}
-		slog.Warn("request failed", "url", ep.URL, "error", err)
+		slog.Warn("request failed",
+			"url", sanitizeURL(ep.URL),
+			"error", err)
 		return false
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			slog.Warn("failed to close response body", "url", ep.URL, "error", cerr)
+			slog.Warn("failed to close response body",
+				"url", sanitizeURL(ep.URL),
+				"error", cerr)
 		}
 	}()
 
@@ -483,28 +577,31 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 	limited := io.LimitReader(resp.Body, m.monitorConfig.maxResponseBodySize)
 	written, err := io.Copy(io.Discard, limited)
 	if err != nil {
-		slog.Warn("failed to drain response body", "url", ep.URL, "error", err)
+		slog.Warn("failed to drain response body",
+			"url", sanitizeURL(ep.URL),
+			"error", err)
 	}
-	
+
 	// Предупреждаем, если тело ответа слишком большое
 	if written >= m.monitorConfig.maxResponseBodySize {
 		slog.Warn("response body truncated",
-			"url", ep.URL,
+			"url", sanitizeURL(ep.URL),
 			"size", written,
 			"limit", m.monitorConfig.maxResponseBodySize)
 	}
 
 	if resp.StatusCode != expectedStatus {
 		slog.Warn("unexpected status",
-			"url", ep.URL,
+			"url", sanitizeURL(ep.URL),
 			"status", resp.StatusCode,
 			"expected", expectedStatus)
 		return false
 	}
 
 	duration := time.Since(startTime)
-	slog.Info("check successful",
-		"url", ep.URL,
+	// Используем Debug вместо Info для успешных проверок - меньше шума в логах
+	slog.Debug("check successful",
+		"url", sanitizeURL(ep.URL),
 		"status", resp.StatusCode,
 		"response_size", written,
 		"duration", duration.Round(time.Millisecond))
@@ -512,7 +609,14 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 }
 
 func (m *Monitor) updateState(url string, success bool) {
-	state := m.states[url]
+	val, ok := m.states.Load(url)
+	if !ok {
+		// Это не должно происходить, но добавляем защиту
+		slog.Error("state not found for URL", "url", sanitizeURL(url))
+		return
+	}
+	state := val.(*ServiceState)
+
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
@@ -521,20 +625,21 @@ func (m *Monitor) updateState(url string, success bool) {
 
 	if success {
 		if state.isDown {
-			// Создаем событие для уведомления о восстановлении
-			event := NotifyEvent{
-				endpoint:  url,
-				isDown:    false,
-				timestamp: now,
-				failTime:  state.firstFailTime,
-			}
-			
+			// Получаем событие из пула
+			event := m.eventPool.Get().(*NotifyEvent)
+			event.endpoint = url
+			event.isDown = false
+			event.timestamp = now
+			event.failTime = state.firstFailTime
+
 			select {
 			case m.notifyQueue <- event:
 			default:
-				slog.Warn("notification queue full, dropping recovery event", "url", url)
+				slog.Warn("notification queue full, dropping recovery event",
+					"url", sanitizeURL(url))
+				m.eventPool.Put(event)
 			}
-			
+
 			state.isDown = false
 			state.consecutiveFails = 0
 			state.firstFailTime = time.Time{}
@@ -549,39 +654,39 @@ func (m *Monitor) updateState(url string, success bool) {
 
 		if state.consecutiveFails >= m.monitorConfig.failureThreshold && !state.isDown {
 			state.isDown = true
-			
-			event := NotifyEvent{
-				endpoint:  url,
-				isDown:    true,
-				timestamp: now,
-				failTime:  state.firstFailTime,
-			}
-			
+
+			// Получаем событие из пула
+			event := m.eventPool.Get().(*NotifyEvent)
+			event.endpoint = url
+			event.isDown = true
+			event.timestamp = now
+			event.failTime = state.firstFailTime
+
 			select {
 			case m.notifyQueue <- event:
 			default:
-				slog.Warn("notification queue full, dropping failure event", "url", url)
+				slog.Warn("notification queue full, dropping failure event",
+					"url", sanitizeURL(url))
+				m.eventPool.Put(event)
 			}
 		}
 	}
 }
 
-// notificationWorker оптимизированная версия с минимальным использованием памяти
+// notificationWorker оптимизированная версия с упрощенным управлением таймером
 func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) {
 	defer m.wg.Done()
 
-	// Предаллоцируем slice с capacity для избежания реаллокаций
-	batch := make([]NotifyEvent, 0, m.monitorConfig.maxBatchSize)
+	batch := make([]*NotifyEvent, 0, m.monitorConfig.maxBatchSize)
 	timer := time.NewTimer(m.monitorConfig.notifyBatchWindow)
 	timer.Stop()
-	timerActive := false
 
 	flush := func() {
 		if len(batch) > 0 {
 			m.sendBatchNotification(ctx, batch, notifiers)
-			// Очищаем slice без реаллокации
-			for i := range batch {
-				batch[i] = NotifyEvent{} // обнуляем для GC
+			// Возвращаем события в пул
+			for _, event := range batch {
+				m.eventPool.Put(event)
 			}
 			batch = batch[:0]
 		}
@@ -591,52 +696,38 @@ func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) 
 		select {
 		case event, ok := <-m.notifyQueue:
 			if !ok {
+				timer.Stop()
 				flush()
-				if timerActive {
-					timer.Stop()
-				}
 				return
 			}
-			
+
 			batch = append(batch, event)
-			
+
 			// Если достигли максимального размера батча, отправляем сразу
 			if len(batch) >= m.monitorConfig.maxBatchSize {
-				if timerActive {
-					if !timer.Stop() {
-						select {
-						case <-timer.C:
-						default:
-						}
-					}
-					timerActive = false
-				}
+				timer.Stop()
 				flush()
-			} else if !timerActive {
+			} else if len(batch) == 1 {
+				// Запускаем таймер только для первого события
 				timer.Reset(m.monitorConfig.notifyBatchWindow)
-				timerActive = true
 			}
 
 		case <-timer.C:
-			timerActive = false
 			flush()
 
 		case <-ctx.Done():
-			if timerActive {
-				timer.Stop()
-			}
+			timer.Stop()
 			flush()
 			return
 		}
 	}
 }
 
-func (m *Monitor) sendBatchNotification(ctx context.Context, events []NotifyEvent, notifiers []Notifier) {
+func (m *Monitor) sendBatchNotification(ctx context.Context, events []*NotifyEvent, notifiers []Notifier) {
 	if len(events) == 0 {
 		return
 	}
 
-	// Предаллоцируем slices точного размера для минимизации аллокаций
 	downServices := make([]string, 0, len(events))
 	upServices := make([]string, 0, len(events))
 	downDetails := make(map[string]time.Time, len(events))
@@ -652,18 +743,18 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []NotifyEven
 		}
 	}
 
-	// Точный расчет размера буфера для минимизации реаллокаций
+	// Точный расчет размера буфера
 	estimatedSize := 0
 	if len(downServices) > 0 {
-		estimatedSize += 25 // заголовок
+		estimatedSize += 25
 		for _, svc := range downServices {
-			estimatedSize += len(svc) + 40 // URL + форматирование
+			estimatedSize += len(svc) + 40
 		}
 	}
 	if len(upServices) > 0 {
-		estimatedSize += 30 // заголовок
+		estimatedSize += 30
 		for _, svc := range upServices {
-			estimatedSize += len(svc) + 50 // URL + форматирование + downtime
+			estimatedSize += len(svc) + 50
 		}
 	}
 
