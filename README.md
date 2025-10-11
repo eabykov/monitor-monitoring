@@ -11,7 +11,7 @@ It continuously checks configured endpoints, batches state changes, and sends **
 ## ✨ Features
 
 | Feature | Description |
-||-|
+|-|-|
 | ⚡ **Concurrent checks** | All endpoints are checked in parallel |
 | 🔄 **Automatic retry** | Failed checks are retried once after a configurable delay |
 | 📊 **Batching & de-duplication** | Notifications are batched per window to avoid spam |
@@ -67,7 +67,7 @@ export TELEGRAM_CHAT_ID="-1001234567890"
 ### Environment variables
 
 | Variable | Default | Purpose |
-|-|||
+|-|-|-|
 | `CHECK_INTERVAL` | `1m` | How often to probe all endpoints |
 | `REQUEST_TIMEOUT` | `45s` | HTTP client timeout per check |
 | `RETRY_DELAY` | `5s` | Wait before retrying a failed check |
@@ -137,7 +137,7 @@ go test ./...
 ## 🔍 Troubleshooting
 
 | Symptom | Fix |
-||--|
+|-|-|
 | `TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set` | Export both variables |
 | Telegram messages not arriving | Check bot is in channel and chat ID is correct |
 | `context deadline exceeded` | Increase `REQUEST_TIMEOUT` |
@@ -158,7 +158,7 @@ MIT © [eabykov](https://github.com/eabykov)
 ## 🔗 Links
 
 | Resource | URL |
-|-|--|
+|-|-|
 | 🐛 Issues | https://github.com/eabykov/monitor-monitoring/issues |
 | 💬 Discussions | https://github.com/eabykov/monitor-monitoring/discussions |
 ```
