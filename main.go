@@ -283,7 +283,11 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 		slog.Warn("request failed", "url", ep.URL, "error", err)
 		return false
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Warn("failed to close response body", "url", ep.URL, "error", err)
+		}
+	}()
 
 	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 		slog.Warn("failed to drain response body", "url", ep.URL, "error", err)
@@ -488,7 +492,11 @@ func (m *Monitor) sendToTelegram(message string) bool {
 		slog.Warn("telegram request failed", "error", err)
 		return false
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Warn("failed to close telegram response body", "error", err)
+		}
+	}()
 
 	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 		slog.Warn("failed to drain telegram response body", "error", err)
@@ -529,7 +537,11 @@ func (m *Monitor) sendToMattermost(message string) {
 		slog.Error("mattermost request failed", "error", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Warn("failed to close mattermost response body", "error", err)
+		}
+	}()
 
 	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 		slog.Warn("failed to drain mattermost response body", "error", err)
