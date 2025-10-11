@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -70,7 +72,7 @@ type Endpoint struct {
 }
 
 type ServiceState struct {
-	mu               sync.RWMutex
+	mu               sync.Mutex
 	consecutiveFails int
 	isDown           bool
 	firstFailTime    time.Time
@@ -81,7 +83,6 @@ type Monitor struct {
 	config         Config
 	monitorConfig  MonitorConfig
 	states         map[string]*ServiceState
-	statesMu       sync.RWMutex
 	telegramToken  string
 	telegramChatID string
 	mattermostURL  string
@@ -115,7 +116,7 @@ func run() error {
 	mattermostURL := os.Getenv("MATTERMOST_WEBHOOK_URL")
 
 	if telegramToken == "" || telegramChatID == "" {
-		return fmt.Errorf("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
+		return errors.New("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
 	}
 
 	configPath := "config.yaml"
@@ -134,18 +135,18 @@ func run() error {
 	}
 
 	if len(config.Endpoints) == 0 {
-		return fmt.Errorf("no endpoints configured")
+		return errors.New("no endpoints configured")
 	}
 
 	slog.Info("loaded configuration", "endpoints", len(config.Endpoints))
 	for _, ep := range config.Endpoints {
 		method := ep.Method
 		if method == "" {
-			method = "GET"
+			method = http.MethodGet
 		}
 		expectedStatus := ep.ExpectedStatus
 		if expectedStatus == 0 {
-			expectedStatus = 200
+			expectedStatus = http.StatusOK
 		}
 		slog.Info("monitoring endpoint",
 			"url", ep.URL,
@@ -164,7 +165,7 @@ func run() error {
 	monitor := &Monitor{
 		config:         config,
 		monitorConfig:  monitorConfig,
-		states:         make(map[string]*ServiceState),
+		states:         make(map[string]*ServiceState, len(config.Endpoints)),
 		telegramToken:  telegramToken,
 		telegramChatID: telegramChatID,
 		mattermostURL:  mattermostURL,
@@ -218,6 +219,10 @@ func run() error {
 }
 
 func (m *Monitor) checkAllServices(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+
 	var wg sync.WaitGroup
 	startTime := time.Now()
 	for _, ep := range m.config.Endpoints {
@@ -233,10 +238,14 @@ func (m *Monitor) checkAllServices(ctx context.Context) {
 }
 
 func (m *Monitor) checkService(ctx context.Context, ep Endpoint) {
+	if ctx.Err() != nil {
+		return
+	}
+
 	url := ep.URL
 	success := m.performCheck(ctx, ep)
 
-	if !success {
+	if !success && ctx.Err() == nil {
 		time.Sleep(m.monitorConfig.retryDelay)
 		success = m.performCheck(ctx, ep)
 	}
@@ -247,12 +256,12 @@ func (m *Monitor) checkService(ctx context.Context, ep Endpoint) {
 func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 	method := ep.Method
 	if method == "" {
-		method = "GET"
+		method = http.MethodGet
 	}
 
 	expectedStatus := ep.ExpectedStatus
 	if expectedStatus == 0 {
-		expectedStatus = 200
+		expectedStatus = http.StatusOK
 	}
 
 	startTime := time.Now()
@@ -268,14 +277,13 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			return false
+		}
 		slog.Warn("request failed", "url", ep.URL, "error", err)
 		return false
 	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			slog.Warn("failed to close response body", "url", ep.URL, "error", err)
-		}
-	}()
+	defer resp.Body.Close()
 
 	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 		slog.Warn("failed to drain response body", "url", ep.URL, "error", err)
@@ -298,10 +306,7 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 }
 
 func (m *Monitor) updateState(url string, success bool) {
-	m.statesMu.RLock()
 	state := m.states[url]
-	m.statesMu.RUnlock()
-
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
@@ -310,11 +315,15 @@ func (m *Monitor) updateState(url string, success bool) {
 
 	if success {
 		if state.isDown {
-			m.notifyQueue <- NotifyEvent{
+			select {
+			case m.notifyQueue <- NotifyEvent{
 				endpoint:  url,
 				isDown:    false,
 				timestamp: now,
 				failTime:  state.firstFailTime,
+			}:
+			default:
+				slog.Warn("notification queue full, dropping recovery event", "url", url)
 			}
 			state.isDown = false
 			state.consecutiveFails = 0
@@ -330,11 +339,15 @@ func (m *Monitor) updateState(url string, success bool) {
 
 		if state.consecutiveFails >= m.monitorConfig.failureThreshold && !state.isDown {
 			state.isDown = true
-			m.notifyQueue <- NotifyEvent{
+			select {
+			case m.notifyQueue <- NotifyEvent{
 				endpoint:  url,
 				isDown:    true,
 				timestamp: now,
 				failTime:  state.firstFailTime,
+			}:
+			default:
+				slog.Warn("notification queue full, dropping failure event", "url", url)
 			}
 		}
 	}
@@ -344,10 +357,11 @@ func (m *Monitor) notificationWorker(ctx context.Context) {
 	defer m.wg.Done()
 
 	var batch []NotifyEvent
-	timer := time.NewTimer(m.monitorConfig.notifyBatchWindow)
+	timer := time.NewTimer(0)
 	if !timer.Stop() {
 		<-timer.C
 	}
+	timerActive := false
 
 	for {
 		select {
@@ -359,20 +373,21 @@ func (m *Monitor) notificationWorker(ctx context.Context) {
 				return
 			}
 			batch = append(batch, event)
-			if len(batch) == 1 {
+			if !timerActive {
 				timer.Reset(m.monitorConfig.notifyBatchWindow)
+				timerActive = true
 			}
+
 		case <-timer.C:
+			timerActive = false
 			if len(batch) > 0 {
 				m.sendBatchNotification(batch)
-				batch = nil
+				batch = batch[:0]
 			}
+
 		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
+			if timerActive && !timer.Stop() {
+				<-timer.C
 			}
 			if len(batch) > 0 {
 				m.sendBatchNotification(batch)
@@ -391,7 +406,8 @@ func (m *Monitor) sendBatchNotification(events []NotifyEvent) {
 	downDetails := make(map[string]time.Time)
 	upDetails := make(map[string]time.Time)
 
-	for _, e := range events {
+	for i := range events {
+		e := &events[i]
 		if e.isDown {
 			downServices = append(downServices, e.endpoint)
 			downDetails[e.endpoint] = e.failTime
@@ -401,26 +417,37 @@ func (m *Monitor) sendBatchNotification(events []NotifyEvent) {
 		}
 	}
 
-	var msg string
+	var sb strings.Builder
+	sb.Grow(len(events) * 100)
+
 	if len(downServices) > 0 {
-		msg += "🔴 *Services DOWN:*\n"
+		sb.WriteString("🔴 *Services DOWN:*\n")
 		for _, svc := range downServices {
-			msg += fmt.Sprintf("• %s\n  Failed at: %s\n",
-				svc, downDetails[svc].Format("2006-01-02 15:04:05"))
+			sb.WriteString("• ")
+			sb.WriteString(svc)
+			sb.WriteString("\n  Failed at: ")
+			sb.WriteString(downDetails[svc].Format("2006-01-02 15:04:05"))
+			sb.WriteString("\n")
 		}
 	}
 
 	if len(upServices) > 0 {
-		if msg != "" {
-			msg += "\n"
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
 		}
-		msg += "✅ *Services RECOVERED:*\n"
+		sb.WriteString("✅ *Services RECOVERED:*\n")
 		for _, svc := range upServices {
 			failTime := upDetails[svc]
 			duration := time.Since(failTime).Round(time.Second)
-			msg += fmt.Sprintf("• %s\n  Downtime: %s\n", svc, duration)
+			sb.WriteString("• ")
+			sb.WriteString(svc)
+			sb.WriteString("\n  Downtime: ")
+			sb.WriteString(duration.String())
+			sb.WriteString("\n")
 		}
 	}
+
+	msg := sb.String()
 
 	if !m.sendToTelegram(msg) {
 		if m.mattermostURL != "" {
@@ -449,7 +476,7 @@ func (m *Monitor) sendToTelegram(message string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		slog.Error("failed to create telegram request", "error", err)
 		return false
@@ -461,17 +488,13 @@ func (m *Monitor) sendToTelegram(message string) bool {
 		slog.Warn("telegram request failed", "error", err)
 		return false
 	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			slog.Warn("failed to close telegram response body", "error", err)
-		}
-	}()
+	defer resp.Body.Close()
 
 	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 		slog.Warn("failed to drain telegram response body", "error", err)
 	}
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		slog.Warn("telegram returned non-200 status", "status", resp.StatusCode)
 		return false
 	}
@@ -494,7 +517,7 @@ func (m *Monitor) sendToMattermost(message string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", m.mattermostURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.mattermostURL, bytes.NewReader(body))
 	if err != nil {
 		slog.Error("failed to create mattermost request", "error", err)
 		return
@@ -506,17 +529,13 @@ func (m *Monitor) sendToMattermost(message string) {
 		slog.Error("mattermost request failed", "error", err)
 		return
 	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			slog.Warn("failed to close mattermost response body", "error", err)
-		}
-	}()
+	defer resp.Body.Close()
 
 	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 		slog.Warn("failed to drain mattermost response body", "error", err)
 	}
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		slog.Error("mattermost returned non-200 status", "status", resp.StatusCode)
 		return
 	}
