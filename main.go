@@ -271,9 +271,15 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 		slog.Warn("request failed", "url", ep.URL, "error", err)
 		return false
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Warn("failed to close response body", "url", ep.URL, "error", err)
+		}
+	}()
 
-	io.Copy(io.Discard, resp.Body)
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		slog.Warn("failed to drain response body", "url", ep.URL, "error", err)
+	}
 
 	if resp.StatusCode != expectedStatus {
 		slog.Warn("unexpected status",
@@ -339,7 +345,9 @@ func (m *Monitor) notificationWorker(ctx context.Context) {
 
 	var batch []NotifyEvent
 	timer := time.NewTimer(m.monitorConfig.notifyBatchWindow)
-	timer.Stop()
+	if !timer.Stop() {
+		<-timer.C
+	}
 
 	for {
 		select {
@@ -360,6 +368,12 @@ func (m *Monitor) notificationWorker(ctx context.Context) {
 				batch = nil
 			}
 		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			if len(batch) > 0 {
 				m.sendBatchNotification(batch)
 			}
@@ -447,8 +461,15 @@ func (m *Monitor) sendToTelegram(message string) bool {
 		slog.Warn("telegram request failed", "error", err)
 		return false
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Warn("failed to close telegram response body", "error", err)
+		}
+	}()
+
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		slog.Warn("failed to drain telegram response body", "error", err)
+	}
 
 	if resp.StatusCode != 200 {
 		slog.Warn("telegram returned non-200 status", "status", resp.StatusCode)
@@ -485,8 +506,15 @@ func (m *Monitor) sendToMattermost(message string) {
 		slog.Error("mattermost request failed", "error", err)
 		return
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Warn("failed to close mattermost response body", "error", err)
+		}
+	}()
+
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		slog.Warn("failed to drain mattermost response body", "error", err)
+	}
 
 	if resp.StatusCode != 200 {
 		slog.Error("mattermost returned non-200 status", "status", resp.StatusCode)
