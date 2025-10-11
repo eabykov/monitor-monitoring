@@ -246,31 +246,7 @@ func validateEndpoint(ep Endpoint) error {
 	return nil
 }
 
-// sanitizeHeaders создает копию headers с маскированием чувствительных данных
-func sanitizeHeaders(headers map[string]string) map[string]string {
-	if len(headers) == 0 {
-		return nil
-	}
 
-	sanitized := make(map[string]string, len(headers))
-	sensitiveKeys := map[string]bool{
-		"authorization": true,
-		"x-api-key":     true,
-		"api-key":       true,
-		"token":         true,
-		"secret":        true,
-		"password":      true,
-	}
-
-	for k, v := range headers {
-		if sensitiveKeys[strings.ToLower(k)] {
-			sanitized[k] = "***"
-		} else {
-			sanitized[k] = v
-		}
-	}
-	return sanitized
-}
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
