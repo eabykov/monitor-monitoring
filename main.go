@@ -273,7 +273,7 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 	}
 	defer resp.Body.Close()
 
-	_, _ = io.Copy(io.Discard, resp.Body)
+	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != expectedStatus {
 		slog.Warn("unexpected status",
@@ -448,7 +448,7 @@ func (m *Monitor) sendToTelegram(message string) bool {
 		return false
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != 200 {
 		slog.Warn("telegram returned non-200 status", "status", resp.StatusCode)
@@ -486,7 +486,7 @@ func (m *Monitor) sendToMattermost(message string) {
 		return
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != 200 {
 		slog.Error("mattermost returned non-200 status", "status", resp.StatusCode)
@@ -495,4 +495,3 @@ func (m *Monitor) sendToMattermost(message string) {
 
 	slog.Info("notification sent to Mattermost (fallback)")
 }
-
