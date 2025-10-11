@@ -246,8 +246,6 @@ func validateEndpoint(ep Endpoint) error {
 	return nil
 }
 
-
-
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
