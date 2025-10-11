@@ -1,12 +1,6 @@
-# Monitor Monitoring
+# Monitor Monitoring [![Go Report Card](https://goreportcard.com/badge/github.com/eabykov/monitor-monitoring)](https://goreportcard.com/report/github.com/eabykov/monitor-monitoring) ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/eabykov/monitor-monitoring) ![License](https://img.shields.io/github/license/eabykov/monitor-monitoring)
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/eabykov/monitor-monitoring)](https://goreportcard.com/report/github.com/eabykov/monitor-monitoring)
-![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/eabykov/monitor-monitoring)
-![License](https://img.shields.io/github/license/eabykov/monitor-monitoring)
-
-A lightweight, concurrent HTTP(S) service monitor written in Go.  
-
-It continuously checks configured endpoints, batches state changes, and sends **Telegram** alerts (with optional **Mattermost** fallback) whenever a service goes **DOWN** or **RECOVERED**.
+A lightweight, concurrent HTTP(S) service monitor written in Go. It continuously checks configured endpoints, batches state changes, and sends **Telegram** alerts (with optional **Mattermost** fallback) whenever a service goes **DOWN** or **RECOVERED**.
 
 ## ✨ Features
 
