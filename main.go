@@ -173,7 +173,11 @@ func sendJSONRequest(ctx context.Context, client *http.Client, url string, paylo
 	if err != nil {
 		return fmt.Errorf("do request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			slog.Warn("failed to close response body", "error", cerr)
+		}
+	}()
 
 	// Ограничиваем чтение ответа до 1MB для защиты от OOM
 	limited := io.LimitReader(resp.Body, 1<<20)
@@ -469,7 +473,11 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 		slog.Warn("request failed", "url", ep.URL, "error", err)
 		return false
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			slog.Warn("failed to close response body", "url", ep.URL, "error", cerr)
+		}
+	}()
 
 	// КРИТИЧНО: Ограничиваем чтение тела ответа для защиты от OOM
 	limited := io.LimitReader(resp.Body, m.monitorConfig.maxResponseBodySize)
