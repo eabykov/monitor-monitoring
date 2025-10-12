@@ -78,20 +78,16 @@ type Config struct {
 }
 
 type Endpoint struct {
-	URL            string            `yaml:"url,omitempty"`             // для HTTP проверок
-	Type           string            `yaml:"type,omitempty"`            // http, dns, tcp
-	Method         string            `yaml:"method,omitempty"`          // для HTTP
-	ExpectedStatus int               `yaml:"expected_status,omitempty"` // для HTTP
-	Headers        map[string]string `yaml:"headers,omitempty"`         // для HTTP
-
-	// Для DNS проверок
-	Host       string `yaml:"host,omitempty"`        // хост для DNS или TCP
-	RecordType string `yaml:"record_type,omitempty"` // A, AAAA, CNAME
-	Expected   string `yaml:"expected,omitempty"`    // ожидаемое значение (опционально)
-
-	// Для TCP проверок
-	Port    int    `yaml:"port,omitempty"`    // порт для TCP
-	Address string `yaml:"address,omitempty"` // полный адрес для TCP (альтернатива host:port)
+	URL            string            `yaml:"url,omitempty"`
+	Type           string            `yaml:"type,omitempty"`
+	Method         string            `yaml:"method,omitempty"`
+	ExpectedStatus int               `yaml:"expected_status,omitempty"`
+	Headers        map[string]string `yaml:"headers,omitempty"`
+	Host           string            `yaml:"host,omitempty"`
+	RecordType     string            `yaml:"record_type,omitempty"`
+	Expected       string            `yaml:"expected,omitempty"`
+	Port           int               `yaml:"port,omitempty"`
+	Address        string            `yaml:"address,omitempty"`
 }
 
 func (e Endpoint) GetIdentifier() string {
@@ -103,7 +99,7 @@ func (e Endpoint) GetIdentifier() string {
 			return fmt.Sprintf("tcp://%s", e.Address)
 		}
 		return fmt.Sprintf("tcp://%s:%d", e.Host, e.Port)
-	default: // http
+	default:
 		return e.URL
 	}
 }
@@ -129,6 +125,7 @@ type Monitor struct {
 	semaphore      chan struct{}
 	wg             sync.WaitGroup
 	eventPool      sync.Pool
+	shutdown       chan struct{}
 }
 
 type NotifyEvent struct {
@@ -210,6 +207,7 @@ func sendJSONRequest(ctx context.Context, client *http.Client, targetURL string,
 
 	return nil
 }
+
 func maskSensitiveString(s string, showLast int) string {
 	if len(s) <= showLast {
 		return "***"
@@ -227,10 +225,13 @@ func sanitizeURL(rawURL string) string {
 	return parsed.String()
 }
 
-func validateEndpoint(ep Endpoint) error {
+func validateEndpoint(ep *Endpoint) error {
 	endpointType := strings.ToLower(ep.Type)
 	if endpointType == "" {
 		endpointType = "http"
+		ep.Type = endpointType
+	} else {
+		ep.Type = endpointType
 	}
 
 	switch endpointType {
@@ -276,6 +277,7 @@ func validateEndpoint(ep Endpoint) error {
 		if recordType == "" {
 			return errors.New("record_type is required for DNS endpoint")
 		}
+		ep.RecordType = recordType
 
 		validTypes := map[string]bool{"A": true, "AAAA": true, "CNAME": true}
 		if !validTypes[recordType] {
@@ -371,13 +373,8 @@ func run() error {
 		return errors.New("no endpoints configured")
 	}
 
-	for i, ep := range config.Endpoints {
-		if ep.Type == "" {
-			config.Endpoints[i].Type = "http"
-		}
-		config.Endpoints[i].Type = strings.ToLower(config.Endpoints[i].Type)
-
-		if err := validateEndpoint(config.Endpoints[i]); err != nil {
+	for i := range config.Endpoints {
+		if err := validateEndpoint(&config.Endpoints[i]); err != nil {
 			return fmt.Errorf("endpoint %d validation failed: %w", i, err)
 		}
 	}
@@ -388,6 +385,17 @@ func run() error {
 	}
 
 	monitorConfig := loadMonitorConfig()
+
+	if monitorConfig.checkInterval < time.Second {
+		return errors.New("CHECK_INTERVAL must be at least 1 second")
+	}
+	if monitorConfig.failureThreshold < 1 {
+		return errors.New("FAILURE_THRESHOLD must be at least 1")
+	}
+	if monitorConfig.maxConcurrentChecks < 1 {
+		return errors.New("MAX_CONCURRENT_CHECKS must be at least 1")
+	}
+
 	slog.Info("monitor configuration",
 		"check_interval", monitorConfig.checkInterval,
 		"request_timeout", monitorConfig.requestTimeout,
@@ -402,23 +410,35 @@ func run() error {
 		"telegram_chat_id", maskSensitiveString(telegramChatID, 4),
 		"mattermost_enabled", mattermostURL != "")
 
+	transport := &http.Transport{
+		MaxIdleConns:          20,
+		MaxIdleConnsPerHost:   2,
+		IdleConnTimeout:       30 * time.Second,
+		MaxConnsPerHost:       5,
+		DisableKeepAlives:     false,
+		DisableCompression:    false,
+		ResponseHeaderTimeout: 10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   monitorConfig.tcpTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+
 	httpClient := &http.Client{
-		Timeout: monitorConfig.requestTimeout,
-		Transport: &http.Transport{
-			MaxIdleConns:          20,
-			MaxIdleConnsPerHost:   2,
-			IdleConnTimeout:       30 * time.Second,
-			MaxConnsPerHost:       5,
-			DisableKeepAlives:     false,
-			DisableCompression:    false,
-			ResponseHeaderTimeout: 10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
+		Timeout:   monitorConfig.requestTimeout,
+		Transport: transport,
 	}
 
 	resolver := &net.Resolver{
 		PreferGo:     true,
 		StrictErrors: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{
+				Timeout: monitorConfig.dnsTimeout,
+			}
+			return d.DialContext(ctx, network, address)
+		},
 	}
 
 	notifiers := []Notifier{
@@ -447,12 +467,14 @@ func run() error {
 		resolver:       resolver,
 		notifyQueue:    make(chan *NotifyEvent, 100),
 		semaphore:      make(chan struct{}, monitorConfig.maxConcurrentChecks),
+		shutdown:       make(chan struct{}),
 		eventPool: sync.Pool{
 			New: func() interface{} {
 				return &NotifyEvent{}
 			},
 		},
 	}
+
 	for _, ep := range config.Endpoints {
 		monitor.states.Store(ep.GetIdentifier(), &ServiceState{})
 	}
@@ -483,9 +505,30 @@ func run() error {
 			monitor.checkAllServices(ctx)
 		case <-ctx.Done():
 			slog.Info("received shutdown signal, stopping gracefully")
-			close(monitor.notifyQueue)
-			monitor.wg.Wait()
-			slog.Info("shutdown complete")
+
+			close(monitor.shutdown)
+
+			ticker.Stop()
+
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer shutdownCancel()
+
+			done := make(chan struct{})
+			go func() {
+				close(monitor.notifyQueue)
+				monitor.wg.Wait()
+				close(done)
+			}()
+
+			select {
+			case <-done:
+				slog.Info("shutdown complete")
+			case <-shutdownCtx.Done():
+				slog.Warn("shutdown timeout, forcing exit")
+			}
+
+			transport.CloseIdleConnections()
+
 			return nil
 		}
 	}
@@ -507,7 +550,7 @@ func logEndpoint(ep Endpoint) {
 		slog.Info("monitoring endpoint",
 			"type", "TCP",
 			"address", addr)
-	default: // http
+	default:
 		method := ep.Method
 		if method == "" {
 			method = http.MethodGet
@@ -531,12 +574,12 @@ func (m *Monitor) memoryMonitor(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
-	var memStats runtime.MemStats
-
 	for {
 		select {
 		case <-ticker.C:
+			var memStats runtime.MemStats
 			runtime.ReadMemStats(&memStats)
+
 			slog.Info("memory stats",
 				"alloc_mb", memStats.Alloc/1024/1024,
 				"sys_mb", memStats.Sys/1024/1024,
@@ -545,6 +588,7 @@ func (m *Monitor) memoryMonitor(ctx context.Context) {
 
 			if memStats.Alloc > 500*1024*1024 {
 				slog.Warn("high memory usage detected", "alloc_mb", memStats.Alloc/1024/1024)
+				runtime.GC()
 			}
 		case <-ctx.Done():
 			return
@@ -561,6 +605,14 @@ func (m *Monitor) checkAllServices(ctx context.Context) {
 	startTime := time.Now()
 
 	for _, ep := range m.config.Endpoints {
+		select {
+		case <-m.shutdown:
+			slog.Debug("shutdown signal received, stopping health checks")
+			wg.Wait()
+			return
+		default:
+		}
+
 		wg.Add(1)
 		go func(endpoint Endpoint) {
 			defer wg.Done()
@@ -571,9 +623,12 @@ func (m *Monitor) checkAllServices(ctx context.Context) {
 				m.checkService(ctx, endpoint)
 			case <-ctx.Done():
 				return
+			case <-m.shutdown:
+				return
 			}
 		}(ep)
 	}
+
 	wg.Wait()
 
 	duration := time.Since(startTime)
@@ -589,18 +644,27 @@ func (m *Monitor) checkService(ctx context.Context, ep Endpoint) {
 	success := m.performCheck(ctx, ep)
 
 	if !success && ctx.Err() == nil {
+		select {
+		case <-m.shutdown:
+			return
+		default:
+		}
+
 		retryCtx, cancel := context.WithTimeout(ctx, m.monitorConfig.retryDelay+m.monitorConfig.requestTimeout)
 		defer cancel()
 
 		time.Sleep(m.monitorConfig.retryDelay)
-		success = m.performCheck(retryCtx, ep)
+
+		if retryCtx.Err() == nil {
+			success = m.performCheck(retryCtx, ep)
+		}
 	}
 
 	m.updateState(identifier, success)
 }
 
 func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
-	switch ep.Type {
+	switch strings.ToLower(ep.Type) {
 	case "dns":
 		return m.performDNSCheck(ctx, ep)
 	case "tcp":
@@ -764,12 +828,13 @@ func (m *Monitor) performTCPCheck(ctx context.Context, ep Endpoint) bool {
 			"error", err)
 		return false
 	}
-
-	if err := conn.Close(); err != nil {
-		slog.Warn("failed to close TCP connection",
-			"address", address,
-			"error", err)
-	}
+	defer func() {
+		if cerr := conn.Close(); cerr != nil {
+			slog.Debug("failed to close TCP connection",
+				"address", address,
+				"error", cerr)
+		}
+	}()
 
 	duration := time.Since(startTime)
 	slog.Debug("TCP check successful",
@@ -830,7 +895,7 @@ func (m *Monitor) performHTTPCheck(ctx context.Context, ep Endpoint) bool {
 	}
 
 	if written >= m.monitorConfig.maxResponseBodySize {
-		slog.Warn("response body truncated",
+		slog.Debug("response body truncated",
 			"url", sanitizeURL(ep.URL),
 			"size", written,
 			"limit", m.monitorConfig.maxResponseBodySize)
@@ -868,7 +933,8 @@ func (m *Monitor) updateState(identifier string, success bool) {
 	state.lastCheckTime = now
 
 	if success {
-		if state.isDown {
+		wasDown := state.isDown
+		if wasDown {
 			event := m.eventPool.Get().(*NotifyEvent)
 			event.endpoint = identifier
 			event.isDown = false
@@ -877,6 +943,8 @@ func (m *Monitor) updateState(identifier string, success bool) {
 
 			select {
 			case m.notifyQueue <- event:
+			case <-m.shutdown:
+				m.eventPool.Put(event)
 			default:
 				slog.Warn("notification queue full, dropping recovery event",
 					"id", identifier)
@@ -906,6 +974,8 @@ func (m *Monitor) updateState(identifier string, success bool) {
 
 			select {
 			case m.notifyQueue <- event:
+			case <-m.shutdown:
+				m.eventPool.Put(event)
 			default:
 				slog.Warn("notification queue full, dropping failure event",
 					"id", identifier)
@@ -920,7 +990,12 @@ func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) 
 
 	batch := make([]*NotifyEvent, 0, m.monitorConfig.maxBatchSize)
 	timer := time.NewTimer(m.monitorConfig.notifyBatchWindow)
-	timer.Stop()
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
 
 	flush := func() {
 		if len(batch) > 0 {
@@ -936,7 +1011,12 @@ func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) 
 		select {
 		case event, ok := <-m.notifyQueue:
 			if !ok {
-				timer.Stop()
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 				flush()
 				return
 			}
@@ -944,7 +1024,12 @@ func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) 
 			batch = append(batch, event)
 
 			if len(batch) >= m.monitorConfig.maxBatchSize {
-				timer.Stop()
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 				flush()
 			} else if len(batch) == 1 {
 				timer.Reset(m.monitorConfig.notifyBatchWindow)
@@ -954,7 +1039,12 @@ func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) 
 			flush()
 
 		case <-ctx.Done():
-			timer.Stop()
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			flush()
 			return
 		}
@@ -981,17 +1071,15 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []*NotifyEve
 		}
 	}
 
-	estimatedSize := 0
+	estimatedSize := 100
 	if len(downServices) > 0 {
-		estimatedSize += 25
 		for _, svc := range downServices {
-			estimatedSize += len(svc) + 40
+			estimatedSize += len(svc) + 60
 		}
 	}
 	if len(upServices) > 0 {
-		estimatedSize += 30
 		for _, svc := range upServices {
-			estimatedSize += len(svc) + 50
+			estimatedSize += len(svc) + 70
 		}
 	}
 
@@ -1030,8 +1118,10 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []*NotifyEve
 	notifyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
+	var lastErr error
 	for _, notifier := range notifiers {
 		if err := notifier.Send(notifyCtx, msg); err != nil {
+			lastErr = err
 			slog.Warn("notification failed",
 				"notifier", notifier.Name(),
 				"error", err)
@@ -1041,5 +1131,7 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []*NotifyEve
 		return
 	}
 
-	slog.Error("failed to send notification through all channels")
+	if lastErr != nil {
+		slog.Error("failed to send notification through all channels", "last_error", lastErr)
+	}
 }
