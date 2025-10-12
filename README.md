@@ -1,6 +1,6 @@
 # Monitor Monitoring [![Go Report Card](https://goreportcard.com/badge/github.com/eabykov/monitor-monitoring)](https://goreportcard.com/report/github.com/eabykov/monitor-monitoring) ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/eabykov/monitor-monitoring) ![License](https://img.shields.io/github/license/eabykov/monitor-monitoring)
 
-Less than 10MB binary that outperforms enterprise monitoring giants consuming gigabytes of resources. While competitors require entire DevOps teams, this Go masterpiece delivers instant Telegram alerts for HTTP, DNS, and TCP in milliseconds with zero dependencies.
+Less than 10MB binary that outperforms enterprise monitoring giants consuming gigabytes of resources. While competitors require entire SRE/DevOps teams, this Go masterpiece delivers instant Telegram alerts for HTTP, DNS, and TCP in milliseconds with zero dependencies.
 
 ## ✨ Features
 
