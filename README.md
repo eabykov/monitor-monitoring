@@ -1,6 +1,6 @@
 # Monitor Monitoring [![Go Report Card](https://goreportcard.com/badge/github.com/eabykov/monitor-monitoring)](https://goreportcard.com/report/github.com/eabykov/monitor-monitoring) ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/eabykov/monitor-monitoring) ![License](https://img.shields.io/github/license/eabykov/monitor-monitoring)
 
-The ultimate vigilant guardian for your infrastructure. Monitor Monitoring doesn't just check your services – it obsesses over them, delivering instant Telegram alerts the moment something goes sideways. Whether it's HTTP endpoints gasping for air, DNS records vanishing into the digital ether, or TCP ports slamming shut, this lightning-fast Go warrior catches it all before your users even know something's wrong.
+Less than 10MB binary that outperforms enterprise monitoring giants consuming gigabytes of resources. While competitors require entire DevOps teams, this Go masterpiece delivers instant Telegram alerts for HTTP, DNS, and TCP in milliseconds with zero dependencies.
 
 ## ✨ Features
 
