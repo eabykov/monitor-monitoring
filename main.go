@@ -14,1014 +14,49 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"runtime/debug"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/semaphore"
-	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
 )
 
-// Version information
-const (
-	Version   = "2.0.0"
-	UserAgent = "MonitorService/" + Version
-)
-
-// Configuration constants with sane defaults
-const (
-	DefaultCheckInterval       = 60 * time.Second
-	DefaultRequestTimeout      = 30 * time.Second
-	DefaultRetryDelay         = 5 * time.Second
-	DefaultFailureThreshold   = 3
-	DefaultNotifyBatchWindow  = 10 * time.Second
-	DefaultMaxBatchSize       = 50
-	DefaultMaxConcurrentChecks = 10
-	DefaultMaxResponseBodySize = 1 << 20 // 1MB
-	DefaultDNSTimeout         = 5 * time.Second
-	DefaultTCPTimeout         = 10 * time.Second
-	DefaultShutdownTimeout    = 30 * time.Second
-)
-
-// MonitorConfig holds all configuration for the monitor
 type MonitorConfig struct {
-	CheckInterval       time.Duration `json:"check_interval"`
-	RequestTimeout      time.Duration `json:"request_timeout"`
-	RetryDelay         time.Duration `json:"retry_delay"`
-	FailureThreshold   int           `json:"failure_threshold"`
-	NotifyBatchWindow  time.Duration `json:"notify_batch_window"`
-	MaxBatchSize       int           `json:"max_batch_size"`
-	MaxConcurrentChecks int          `json:"max_concurrent_checks"`
-	MaxResponseBodySize int64        `json:"max_response_body_size"`
-	DNSTimeout         time.Duration `json:"dns_timeout"`
-	TCPTimeout         time.Duration `json:"tcp_timeout"`
-	ShutdownTimeout    time.Duration `json:"shutdown_timeout"`
-	EnableMetrics      bool          `json:"enable_metrics"`
-	MetricsPort        int           `json:"metrics_port"`
-}
-
-// LoadMonitorConfig loads configuration from environment with validation
-func LoadMonitorConfig() (*MonitorConfig, error) {
-	cfg := &MonitorConfig{
-		CheckInterval:       getEnvDuration("CHECK_INTERVAL", DefaultCheckInterval),
-		RequestTimeout:      getEnvDuration("REQUEST_TIMEOUT", DefaultRequestTimeout),
-		RetryDelay:         getEnvDuration("RETRY_DELAY", DefaultRetryDelay),
-		FailureThreshold:   getEnvInt("FAILURE_THRESHOLD", DefaultFailureThreshold),
-		NotifyBatchWindow:  getEnvDuration("NOTIFY_BATCH_WINDOW", DefaultNotifyBatchWindow),
-		MaxBatchSize:       getEnvInt("MAX_BATCH_SIZE", DefaultMaxBatchSize),
-		MaxConcurrentChecks: getEnvInt("MAX_CONCURRENT_CHECKS", DefaultMaxConcurrentChecks),
-		MaxResponseBodySize: int64(getEnvInt("MAX_RESPONSE_BODY_SIZE", DefaultMaxResponseBodySize)),
-		DNSTimeout:         getEnvDuration("DNS_TIMEOUT", DefaultDNSTimeout),
-		TCPTimeout:         getEnvDuration("TCP_TIMEOUT", DefaultTCPTimeout),
-		ShutdownTimeout:    getEnvDuration("SHUTDOWN_TIMEOUT", DefaultShutdownTimeout),
-		EnableMetrics:      getEnvBool("ENABLE_METRICS", true),
-		MetricsPort:        getEnvInt("METRICS_PORT", 9090),
-	}
-
-	// Validate configuration
-	if cfg.CheckInterval < time.Second {
-		return nil, errors.New("check_interval must be at least 1 second")
-	}
-	if cfg.MaxConcurrentChecks < 1 || cfg.MaxConcurrentChecks > 1000 {
-		return nil, errors.New("max_concurrent_checks must be between 1 and 1000")
-	}
-	if cfg.FailureThreshold < 1 || cfg.FailureThreshold > 100 {
-		return nil, errors.New("failure_threshold must be between 1 and 100")
-	}
-
-	return cfg, nil
-}
-
-// Config represents the service configuration
-type Config struct {
-	Endpoints []Endpoint `yaml:"endpoints" json:"endpoints"`
-	Version   string     `yaml:"version" json:"version"`
-}
-
-// Endpoint represents a service endpoint to monitor
-type Endpoint struct {
-	URL            string            `yaml:"url,omitempty" json:"url,omitempty"`
-	Type           string            `yaml:"type,omitempty" json:"type,omitempty"`
-	Method         string            `yaml:"method,omitempty" json:"method,omitempty"`
-	ExpectedStatus int               `yaml:"expected_status,omitempty" json:"expected_status,omitempty"`
-	Headers        map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
-	Host           string            `yaml:"host,omitempty" json:"host,omitempty"`
-	RecordType     string            `yaml:"record_type,omitempty" json:"record_type,omitempty"`
-	Expected       string            `yaml:"expected,omitempty" json:"expected,omitempty"`
-	Port           int               `yaml:"port,omitempty" json:"port,omitempty"`
-	Address        string            `yaml:"address,omitempty" json:"address,omitempty"`
-	Timeout        time.Duration     `yaml:"timeout,omitempty" json:"timeout,omitempty"`
-	Tags           []string          `yaml:"tags,omitempty" json:"tags,omitempty"`
-}
-
-// GetIdentifier returns a unique identifier for the endpoint
-func (e Endpoint) GetIdentifier() string {
-	switch strings.ToLower(e.Type) {
-	case "dns":
-		return fmt.Sprintf("dns://%s/%s", e.Host, e.RecordType)
-	case "tcp":
-		if e.Address != "" {
-			return fmt.Sprintf("tcp://%s", e.Address)
-		}
-		return fmt.Sprintf("tcp://%s:%d", e.Host, e.Port)
-	default:
-		return e.URL
-	}
-}
-
-// ServiceState represents the current state of a monitored service
-type ServiceState struct {
-	mu                 sync.RWMutex
-	consecutiveFails   int32
-	isDown             atomic.Bool
-	firstFailTime      atomic.Value // time.Time
-	lastCheckTime      atomic.Value // time.Time
-	lastResponseTime   atomic.Value // time.Duration
-	totalChecks        atomic.Uint64
-	totalFailures      atomic.Uint64
-	lastError          atomic.Value // string
-}
-
-// NewServiceState creates a new service state
-func NewServiceState() *ServiceState {
-	s := &ServiceState{}
-	s.firstFailTime.Store(time.Time{})
-	s.lastCheckTime.Store(time.Time{})
-	s.lastResponseTime.Store(time.Duration(0))
-	s.lastError.Store("")
-	return s
-}
-
-// Update updates the service state atomically
-func (s *ServiceState) Update(success bool, responseTime time.Duration, err error) (stateChanged bool, isDown bool) {
-	s.totalChecks.Add(1)
-	s.lastCheckTime.Store(time.Now())
-	s.lastResponseTime.Store(responseTime)
-	
-	if err != nil {
-		s.lastError.Store(err.Error())
-	} else {
-		s.lastError.Store("")
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if success {
-		if s.isDown.Load() {
-			s.isDown.Store(false)
-			s.consecutiveFails = 0
-			s.firstFailTime.Store(time.Time{})
-			return true, false
-		}
-		s.consecutiveFails = 0
-	} else {
-		s.totalFailures.Add(1)
-		oldFails := s.consecutiveFails
-		s.consecutiveFails++
-		
-		if oldFails == 0 {
-			s.firstFailTime.Store(time.Now())
-		}
-		
-		// Check if we just crossed the threshold
-		if s.consecutiveFails >= int32(DefaultFailureThreshold) && !s.isDown.Load() {
-			s.isDown.Store(true)
-			return true, true
-		}
-	}
-	
-	return false, s.isDown.Load()
-}
-
-// Checker interface for different check types
-type Checker interface {
-	Check(ctx context.Context, endpoint Endpoint) error
-	Type() string
-}
-
-// HTTPChecker implements HTTP endpoint checking
-type HTTPChecker struct {
-	client              *http.Client
+	checkInterval       time.Duration
+	requestTimeout      time.Duration
+	retryDelay          time.Duration
+	failureThreshold    int
+	notifyBatchWindow   time.Duration
+	maxBatchSize        int
+	maxConcurrentChecks int
 	maxResponseBodySize int64
-	rateLimiter        *rate.Limiter
+	dnsTimeout          time.Duration
+	tcpTimeout          time.Duration
 }
 
-// NewHTTPChecker creates a new HTTP checker with optimized settings
-func NewHTTPChecker(timeout time.Duration, maxBodySize int64) *HTTPChecker {
-	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:          (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-			DualStack: true,
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
-		MaxConnsPerHost:       20,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		DisableCompression:    false,
-		DisableKeepAlives:     false,
-		ResponseHeaderTimeout: timeout,
-	}
-
-	return &HTTPChecker{
-		client: &http.Client{
-			Transport: transport,
-			Timeout:   timeout,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) >= 10 {
-					return errors.New("too many redirects")
-				}
-				return nil
-			},
-		},
-		maxResponseBodySize: maxBodySize,
-		rateLimiter:        rate.NewLimiter(rate.Every(100*time.Millisecond), 10),
+func loadMonitorConfig() MonitorConfig {
+	return MonitorConfig{
+		checkInterval:       getEnvDuration("CHECK_INTERVAL", 1*time.Minute),
+		requestTimeout:      getEnvDuration("REQUEST_TIMEOUT", 45*time.Second),
+		retryDelay:          getEnvDuration("RETRY_DELAY", 5*time.Second),
+		failureThreshold:    getEnvInt("FAILURE_THRESHOLD", 3),
+		notifyBatchWindow:   getEnvDuration("NOTIFY_BATCH_WINDOW", 10*time.Second),
+		maxBatchSize:        getEnvInt("MAX_BATCH_SIZE", 50),
+		maxConcurrentChecks: getEnvInt("MAX_CONCURRENT_CHECKS", 10),
+		maxResponseBodySize: int64(getEnvInt("MAX_RESPONSE_BODY_SIZE", 1048576)),
+		dnsTimeout:          getEnvDuration("DNS_TIMEOUT", 5*time.Second),
+		tcpTimeout:          getEnvDuration("TCP_TIMEOUT", 10*time.Second),
 	}
 }
-
-// Check performs an HTTP check
-func (h *HTTPChecker) Check(ctx context.Context, endpoint Endpoint) error {
-	// Rate limiting
-	if err := h.rateLimiter.Wait(ctx); err != nil {
-		return fmt.Errorf("rate limit: %w", err)
-	}
-
-	method := endpoint.Method
-	if method == "" {
-		method = http.MethodGet
-	}
-
-	expectedStatus := endpoint.ExpectedStatus
-	if expectedStatus == 0 {
-		expectedStatus = http.StatusOK
-	}
-
-	// Validate URL to prevent SSRF
-	if err := validateURL(endpoint.URL); err != nil {
-		return fmt.Errorf("invalid URL: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, endpoint.URL, nil)
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-
-	req.Header.Set("User-Agent", UserAgent)
-	for k, v := range endpoint.Headers {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := h.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("http request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Use io.Copy with limit reader for efficiency
-	limited := io.LimitReader(resp.Body, h.maxResponseBodySize)
-	written, err := io.Copy(io.Discard, limited)
-	if err != nil {
-		return fmt.Errorf("read response: %w", err)
-	}
-
-	if written >= h.maxResponseBodySize {
-		slog.Warn("response body truncated",
-			"url", sanitizeURL(endpoint.URL),
-			"size", written)
-	}
-
-	if resp.StatusCode != expectedStatus {
-		return fmt.Errorf("unexpected status code: got %d, want %d", resp.StatusCode, expectedStatus)
-	}
-
-	return nil
-}
-
-// Type returns the checker type
-func (h *HTTPChecker) Type() string {
-	return "http"
-}
-
-// DNSChecker implements DNS endpoint checking
-type DNSChecker struct {
-	resolver *net.Resolver
-	cache    *DNSCache
-}
-
-// DNSCache implements a simple DNS cache with TTL
-type DNSCache struct {
-	mu      sync.RWMutex
-	entries map[string]*dnsCacheEntry
-}
-
-type dnsCacheEntry struct {
-	value     interface{}
-	expiresAt time.Time
-}
-
-// NewDNSCache creates a new DNS cache
-func NewDNSCache() *DNSCache {
-	cache := &DNSCache{
-		entries: make(map[string]*dnsCacheEntry),
-	}
-	
-	// Start cleanup goroutine
-	go cache.cleanup()
-	
-	return cache
-}
-
-func (c *DNSCache) cleanup() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-	
-	for range ticker.C {
-		c.mu.Lock()
-		now := time.Now()
-		for k, v := range c.entries {
-			if v.expiresAt.Before(now) {
-				delete(c.entries, k)
-			}
-		}
-		c.mu.Unlock()
-	}
-}
-
-func (c *DNSCache) Get(key string) (interface{}, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	
-	entry, ok := c.entries[key]
-	if !ok || entry.expiresAt.Before(time.Now()) {
-		return nil, false
-	}
-	
-	return entry.value, true
-}
-
-func (c *DNSCache) Set(key string, value interface{}, ttl time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	
-	c.entries[key] = &dnsCacheEntry{
-		value:     value,
-		expiresAt: time.Now().Add(ttl),
-	}
-}
-
-// NewDNSChecker creates a new DNS checker
-func NewDNSChecker(timeout time.Duration) *DNSChecker {
-	return &DNSChecker{
-		resolver: &net.Resolver{
-			PreferGo:     true,
-			StrictErrors: true,
-		},
-		cache: NewDNSCache(),
-	}
-}
-
-// Check performs a DNS check
-func (d *DNSChecker) Check(ctx context.Context, endpoint Endpoint) error {
-	recordType := strings.ToUpper(endpoint.RecordType)
-	cacheKey := fmt.Sprintf("%s:%s", endpoint.Host, recordType)
-	
-	// Check cache first
-	if cached, ok := d.cache.Get(cacheKey); ok {
-		return d.validateDNSResult(endpoint, cached)
-	}
-	
-	var result interface{}
-	var err error
-	
-	switch recordType {
-	case "A":
-		result, err = d.resolver.LookupIPAddr(ctx, endpoint.Host)
-	case "AAAA":
-		result, err = d.resolver.LookupIPAddr(ctx, endpoint.Host)
-	case "CNAME":
-		result, err = d.resolver.LookupCNAME(ctx, endpoint.Host)
-	default:
-		return fmt.Errorf("unsupported record type: %s", recordType)
-	}
-	
-	if err != nil {
-		return fmt.Errorf("dns lookup failed: %w", err)
-	}
-	
-	// Cache the result
-	d.cache.Set(cacheKey, result, 5*time.Minute)
-	
-	return d.validateDNSResult(endpoint, result)
-}
-
-func (d *DNSChecker) validateDNSResult(endpoint Endpoint, result interface{}) error {
-	recordType := strings.ToUpper(endpoint.RecordType)
-	
-	switch recordType {
-	case "A", "AAAA":
-		ips := result.([]net.IPAddr)
-		if len(ips) == 0 {
-			return errors.New("no IP addresses returned")
-		}
-		
-		if endpoint.Expected != "" {
-			expectedIP := net.ParseIP(endpoint.Expected)
-			if expectedIP == nil {
-				return fmt.Errorf("invalid expected IP: %s", endpoint.Expected)
-			}
-			
-			for _, ip := range ips {
-				if ip.IP.Equal(expectedIP) {
-					return nil
-				}
-			}
-			return fmt.Errorf("expected IP %s not found", endpoint.Expected)
-		}
-		
-	case "CNAME":
-		cname := strings.TrimSuffix(result.(string), ".")
-		if endpoint.Expected != "" {
-			expected := strings.TrimSuffix(endpoint.Expected, ".")
-			if cname != expected {
-				return fmt.Errorf("CNAME mismatch: got %s, want %s", cname, expected)
-			}
-		}
-	}
-	
-	return nil
-}
-
-// Type returns the checker type
-func (d *DNSChecker) Type() string {
-	return "dns"
-}
-
-// TCPChecker implements TCP endpoint checking
-type TCPChecker struct {
-	timeout time.Duration
-	dialer  *net.Dialer
-}
-
-// NewTCPChecker creates a new TCP checker
-func NewTCPChecker(timeout time.Duration) *TCPChecker {
-	return &TCPChecker{
-		timeout: timeout,
-		dialer: &net.Dialer{
-			Timeout:   timeout,
-			KeepAlive: 30 * time.Second,
-			DualStack: true,
-		},
-	}
-}
-
-// Check performs a TCP check
-func (t *TCPChecker) Check(ctx context.Context, endpoint Endpoint) error {
-	address := endpoint.Address
-	if address == "" {
-		address = fmt.Sprintf("%s:%d", endpoint.Host, endpoint.Port)
-	}
-	
-	conn, err := t.dialer.DialContext(ctx, "tcp", address)
-	if err != nil {
-		return fmt.Errorf("tcp dial failed: %w", err)
-	}
-	
-	// Set deadline for connection close
-	conn.SetDeadline(time.Now().Add(time.Second))
-	conn.Close()
-	
-	return nil
-}
-
-// Type returns the checker type
-func (t *TCPChecker) Type() string {
-	return "tcp"
-}
-
-// CheckerFactory creates checkers based on endpoint type
-type CheckerFactory struct {
-	httpChecker *HTTPChecker
-	dnsChecker  *DNSChecker
-	tcpChecker  *TCPChecker
-}
-
-// NewCheckerFactory creates a new checker factory
-func NewCheckerFactory(cfg *MonitorConfig) *CheckerFactory {
-	return &CheckerFactory{
-		httpChecker: NewHTTPChecker(cfg.RequestTimeout, cfg.MaxResponseBodySize),
-		dnsChecker:  NewDNSChecker(cfg.DNSTimeout),
-		tcpChecker:  NewTCPChecker(cfg.TCPTimeout),
-	}
-}
-
-// GetChecker returns a checker for the given endpoint type
-func (f *CheckerFactory) GetChecker(endpointType string) (Checker, error) {
-	switch strings.ToLower(endpointType) {
-	case "http", "https", "":
-		return f.httpChecker, nil
-	case "dns":
-		return f.dnsChecker, nil
-	case "tcp":
-		return f.tcpChecker, nil
-	default:
-		return nil, fmt.Errorf("unknown endpoint type: %s", endpointType)
-	}
-}
-
-// NotifyEvent represents a notification event
-type NotifyEvent struct {
-	Endpoint      string        `json:"endpoint"`
-	IsDown        bool          `json:"is_down"`
-	Timestamp     time.Time     `json:"timestamp"`
-	FailTime      time.Time     `json:"fail_time,omitempty"`
-	ResponseTime  time.Duration `json:"response_time"`
-	Error         string        `json:"error,omitempty"`
-}
-
-// Notifier interface for sending notifications
-type Notifier interface {
-	Send(ctx context.Context, events []*NotifyEvent) error
-	Name() string
-}
-
-// TelegramNotifier sends notifications to Telegram
-type TelegramNotifier struct {
-	token      string
-	chatID     string
-	httpClient *http.Client
-	limiter    *rate.Limiter
-}
-
-// NewTelegramNotifier creates a new Telegram notifier
-func NewTelegramNotifier(token, chatID string) *TelegramNotifier {
-	return &TelegramNotifier{
-		token:  token,
-		chatID: chatID,
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
-		limiter: rate.NewLimiter(rate.Every(time.Second), 30), // Telegram rate limit
-	}
-}
-
-// Send sends notifications to Telegram
-func (t *TelegramNotifier) Send(ctx context.Context, events []*NotifyEvent) error {
-	if err := t.limiter.Wait(ctx); err != nil {
-		return fmt.Errorf("rate limit: %w", err)
-	}
-	
-	message := formatNotificationMessage(events)
-	
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", t.token)
-	payload := map[string]interface{}{
-		"chat_id":    t.chatID,
-		"text":       message,
-		"parse_mode": "Markdown",
-	}
-	
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal payload: %w", err)
-	}
-	
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	
-	resp, err := t.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("send request: %w", err)
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
-	}
-	
-	return nil
-}
-
-// Name returns the notifier name
-func (t *TelegramNotifier) Name() string {
-	return "Telegram"
-}
-
-// formatNotificationMessage formats events into a notification message
-func formatNotificationMessage(events []*NotifyEvent) string {
-	var sb strings.Builder
-	sb.Grow(512) // Pre-allocate
-	
-	downEvents := make([]*NotifyEvent, 0, len(events))
-	upEvents := make([]*NotifyEvent, 0, len(events))
-	
-	for _, e := range events {
-		if e.IsDown {
-			downEvents = append(downEvents, e)
-		} else {
-			upEvents = append(upEvents, e)
-		}
-	}
-	
-	if len(downEvents) > 0 {
-		sb.WriteString("🔴 *Services DOWN:*\n")
-		for _, e := range downEvents {
-			fmt.Fprintf(&sb, "• %s\n", e.Endpoint)
-			if e.Error != "" {
-				fmt.Fprintf(&sb, "  Error: %s\n", e.Error)
-			}
-			fmt.Fprintf(&sb, "  Failed at: %s\n", e.FailTime.Format("15:04:05"))
-		}
-	}
-	
-	if len(upEvents) > 0 {
-		if sb.Len() > 0 {
-			sb.WriteString("\n")
-		}
-		sb.WriteString("✅ *Services RECOVERED:*\n")
-		for _, e := range upEvents {
-			downtime := e.Timestamp.Sub(e.FailTime).Round(time.Second)
-			fmt.Fprintf(&sb, "• %s\n", e.Endpoint)
-			fmt.Fprintf(&sb, "  Downtime: %s\n", downtime)
-		}
-	}
-	
-	return sb.String()
-}
-
-// Monitor is the main monitoring service
-type Monitor struct {
-	config          *Config
-	monitorConfig   *MonitorConfig
-	checkerFactory  *CheckerFactory
-	states          *StateManager
-	notifiers       []Notifier
-	notifyQueue     chan *NotifyEvent
-	semaphore       *semaphore.Weighted
-	metrics         *Metrics
-	wg              sync.WaitGroup
-	cancel          context.CancelFunc
-}
-
-// StateManager manages service states safely
-type StateManager struct {
-	states sync.Map // map[string]*ServiceState
-}
-
-// NewStateManager creates a new state manager
-func NewStateManager() *StateManager {
-	return &StateManager{}
-}
-
-// Get returns a service state
-func (sm *StateManager) Get(id string) *ServiceState {
-	if v, ok := sm.states.Load(id); ok {
-		return v.(*ServiceState)
-	}
-	
-	// Create new state if not exists
-	state := NewServiceState()
-	actual, _ := sm.states.LoadOrStore(id, state)
-	return actual.(*ServiceState)
-}
-
-// Metrics tracks monitoring metrics
-type Metrics struct {
-	checksTotal      atomic.Uint64
-	checksFailedTotal atomic.Uint64
-	checkDuration    atomic.Value // time.Duration
-	notificationsSent atomic.Uint64
-	goroutines       atomic.Int32
-}
-
-// NewMonitor creates a new monitor instance
-func NewMonitor(cfg *Config, mcfg *MonitorConfig) (*Monitor, error) {
-	checkerFactory := NewCheckerFactory(mcfg)
-	
-	// Validate endpoints
-	for i, ep := range cfg.Endpoints {
-		if err := validateEndpoint(ep); err != nil {
-			return nil, fmt.Errorf("endpoint %d: %w", i, err)
-		}
-	}
-	
-	ctx, cancel := context.WithCancel(context.Background())
-	
-	m := &Monitor{
-		config:         cfg,
-		monitorConfig:  mcfg,
-		checkerFactory: checkerFactory,
-		states:         NewStateManager(),
-		notifiers:      make([]Notifier, 0),
-		notifyQueue:    make(chan *NotifyEvent, 1000), // Buffered queue
-		semaphore:      semaphore.NewWeighted(int64(mcfg.MaxConcurrentChecks)),
-		metrics:        &Metrics{},
-		cancel:         cancel,
-	}
-	
-	m.metrics.checkDuration.Store(time.Duration(0))
-	
-	return m, nil
-}
-
-// AddNotifier adds a notifier to the monitor
-func (m *Monitor) AddNotifier(n Notifier) {
-	m.notifiers = append(m.notifiers, n)
-}
-
-// Start starts the monitoring service
-func (m *Monitor) Start(ctx context.Context) error {
-	slog.Info("starting monitor service",
-		"version", Version,
-		"endpoints", len(m.config.Endpoints),
-		"interval", m.monitorConfig.CheckInterval)
-	
-	// Start notification worker
-	m.wg.Add(1)
-	go m.notificationWorker(ctx)
-	
-	// Start metrics reporter
-	if m.monitorConfig.EnableMetrics {
-		m.wg.Add(1)
-		go m.metricsReporter(ctx)
-	}
-	
-	// Start monitoring loop
-	ticker := time.NewTicker(m.monitorConfig.CheckInterval)
-	defer ticker.Stop()
-	
-	// Initial check
-	m.checkAllEndpoints(ctx)
-	
-	for {
-		select {
-		case <-ticker.C:
-			m.checkAllEndpoints(ctx)
-		case <-ctx.Done():
-			return m.shutdown()
-		}
-	}
-}
-
-// checkAllEndpoints checks all configured endpoints concurrently
-func (m *Monitor) checkAllEndpoints(ctx context.Context) {
-	start := time.Now()
-	
-	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(m.monitorConfig.MaxConcurrentChecks)
-	
-	for _, endpoint := range m.config.Endpoints {
-		endpoint := endpoint // Capture loop variable
-		
-		g.Go(func() error {
-			// Acquire semaphore
-			if err := m.semaphore.Acquire(ctx, 1); err != nil {
-				return err
-			}
-			defer m.semaphore.Release(1)
-			
-			m.checkEndpoint(ctx, endpoint)
-			return nil
-		})
-	}
-	
-	// Wait for all checks to complete
-	if err := g.Wait(); err != nil && err != context.Canceled {
-		slog.Error("check cycle error", "error", err)
-	}
-	
-	duration := time.Since(start)
-	m.metrics.checkDuration.Store(duration)
-	
-	slog.Debug("check cycle completed",
-		"duration", duration,
-		"endpoints", len(m.config.Endpoints))
-}
-
-// checkEndpoint checks a single endpoint
-func (m *Monitor) checkEndpoint(ctx context.Context, endpoint Endpoint) {
-	m.metrics.checksTotal.Add(1)
-	
-	checker, err := m.checkerFactory.GetChecker(endpoint.Type)
-	if err != nil {
-		slog.Error("get checker failed", "error", err)
-		return
-	}
-	
-	// Create timeout context for this check
-	checkCtx, cancel := context.WithTimeout(ctx, m.monitorConfig.RequestTimeout)
-	defer cancel()
-	
-	// Perform check with retry
-	start := time.Now()
-	err = checker.Check(checkCtx, endpoint)
-	responseTime := time.Since(start)
-	
-	// Retry logic with exponential backoff
-	if err != nil && checkCtx.Err() == nil {
-		time.Sleep(m.monitorConfig.RetryDelay)
-		
-		retryCtx, retryCancel := context.WithTimeout(ctx, m.monitorConfig.RequestTimeout)
-		defer retryCancel()
-		
-		start = time.Now()
-		err = checker.Check(retryCtx, endpoint)
-		responseTime = time.Since(start)
-	}
-	
-	// Update state
-	success := err == nil
-	if !success {
-		m.metrics.checksFailedTotal.Add(1)
-	}
-	
-	state := m.states.Get(endpoint.GetIdentifier())
-	stateChanged, isDown := state.Update(success, responseTime, err)
-	
-	if stateChanged {
-		// Send notification
-		event := &NotifyEvent{
-			Endpoint:     endpoint.GetIdentifier(),
-			IsDown:       isDown,
-			Timestamp:    time.Now(),
-			ResponseTime: responseTime,
-		}
-		
-		if isDown {
-			event.FailTime = state.firstFailTime.Load().(time.Time)
-			if err != nil {
-				event.Error = err.Error()
-			}
-		} else {
-			event.FailTime = state.firstFailTime.Load().(time.Time)
-		}
-		
-		select {
-		case m.notifyQueue <- event:
-		case <-ctx.Done():
-			return
-		default:
-			slog.Warn("notification queue full, dropping event",
-				"endpoint", endpoint.GetIdentifier())
-		}
-	}
-	
-	// Log result
-	if success {
-		slog.Debug("check successful",
-			"endpoint", endpoint.GetIdentifier(),
-			"response_time", responseTime)
-	} else {
-		slog.Warn("check failed",
-			"endpoint", endpoint.GetIdentifier(),
-			"error", err,
-			"response_time", responseTime)
-	}
-}
-
-// notificationWorker processes notification events
-func (m *Monitor) notificationWorker(ctx context.Context) {
-	defer m.wg.Done()
-	
-	batch := make([]*NotifyEvent, 0, m.monitorConfig.MaxBatchSize)
-	timer := time.NewTimer(m.monitorConfig.NotifyBatchWindow)
-	timer.Stop()
-	
-	send := func() {
-		if len(batch) == 0 {
-			return
-		}
-		
-		for _, notifier := range m.notifiers {
-			notifyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			err := notifier.Send(notifyCtx, batch)
-			cancel()
-			
-			if err != nil {
-				slog.Error("notification failed",
-					"notifier", notifier.Name(),
-					"error", err)
-				continue
-			}
-			
-			m.metrics.notificationsSent.Add(uint64(len(batch)))
-			slog.Info("notifications sent",
-				"notifier", notifier.Name(),
-				"count", len(batch))
-			break
-		}
-		
-		batch = batch[:0]
-	}
-	
-	for {
-		select {
-		case event := <-m.notifyQueue:
-			batch = append(batch, event)
-			
-			if len(batch) >= m.monitorConfig.MaxBatchSize {
-				timer.Stop()
-				send()
-			} else if len(batch) == 1 {
-				timer.Reset(m.monitorConfig.NotifyBatchWindow)
-			}
-			
-		case <-timer.C:
-			send()
-			
-		case <-ctx.Done():
-			timer.Stop()
-			send() // Send any pending notifications
-			return
-		}
-	}
-}
-
-// metricsReporter reports metrics periodically
-func (m *Monitor) metricsReporter(ctx context.Context) {
-	defer m.wg.Done()
-	
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	
-	for {
-		select {
-		case <-ticker.C:
-			var memStats runtime.MemStats
-			runtime.ReadMemStats(&memStats)
-			
-			slog.Info("metrics",
-				"checks_total", m.metrics.checksTotal.Load(),
-				"checks_failed", m.metrics.checksFailedTotal.Load(),
-				"check_duration", m.metrics.checkDuration.Load().(time.Duration),
-				"notifications_sent", m.metrics.notificationsSent.Load(),
-				"goroutines", runtime.NumGoroutine(),
-				"memory_alloc_mb", memStats.Alloc/1024/1024,
-				"memory_sys_mb", memStats.Sys/1024/1024,
-				"gc_runs", memStats.NumGC)
-			
-			// Force GC if memory usage is high
-			if memStats.Alloc > 500*1024*1024 {
-				slog.Warn("high memory usage, forcing GC",
-					"alloc_mb", memStats.Alloc/1024/1024)
-				runtime.GC()
-				debug.FreeOSMemory()
-			}
-			
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// shutdown performs graceful shutdown
-func (m *Monitor) shutdown() error {
-	slog.Info("shutting down monitor service")
-	
-	// Cancel context
-	m.cancel()
-	
-	// Close notification queue
-	close(m.notifyQueue)
-	
-	// Wait for workers with timeout
-	done := make(chan struct{})
-	go func() {
-		m.wg.Wait()
-		close(done)
-	}()
-	
-	select {
-	case <-done:
-		slog.Info("shutdown completed")
-		return nil
-	case <-time.After(m.monitorConfig.ShutdownTimeout):
-		return errors.New("shutdown timeout exceeded")
-	}
-}
-
-// Helper functions
 
 func getEnvDuration(key string, defaultVal time.Duration) time.Duration {
 	if val := os.Getenv(key); val != "" {
 		if d, err := time.ParseDuration(val); err == nil {
 			return d
 		}
-		slog.Warn("invalid duration",
-			"key", key,
-			"value", val,
-			"using", defaultVal)
+		slog.Warn("invalid duration, using default",
+			"key", key, "default", defaultVal)
 	}
 	return defaultVal
 }
@@ -1032,61 +67,154 @@ func getEnvInt(key string, defaultVal int) int {
 		if _, err := fmt.Sscanf(val, "%d", &i); err == nil && i > 0 {
 			return i
 		}
-		slog.Warn("invalid integer",
-			"key", key,
-			"value", val,
-			"using", defaultVal)
+		slog.Warn("invalid integer, using default",
+			"key", key, "default", defaultVal)
 	}
 	return defaultVal
 }
 
-func getEnvBool(key string, defaultVal bool) bool {
-	if val := os.Getenv(key); val != "" {
-		switch strings.ToLower(val) {
-		case "true", "1", "yes", "on":
-			return true
-		case "false", "0", "no", "off":
-			return false
-		default:
-			slog.Warn("invalid boolean",
-				"key", key,
-				"value", val,
-				"using", defaultVal)
-		}
-	}
-	return defaultVal
+type Config struct {
+	Endpoints []Endpoint `yaml:"endpoints"`
 }
 
-func validateURL(rawURL string) error {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return err
-	}
-	
-	// Check scheme
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return errors.New("scheme must be http or https")
-	}
-	
-	// Check host
-	if parsed.Host == "" {
-		return errors.New("host is required")
-	}
-	
-	// Prevent SSRF attacks
-	host, _, err := net.SplitHostPort(parsed.Host)
-	if err != nil {
-		host = parsed.Host
-	}
-	
-	ip := net.ParseIP(host)
-	if ip != nil {
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-			return errors.New("private/local IP addresses are not allowed")
+type Endpoint struct {
+	URL            string            `yaml:"url,omitempty"`             // для HTTP проверок
+	Type           string            `yaml:"type,omitempty"`            // http, dns, tcp
+	Method         string            `yaml:"method,omitempty"`          // для HTTP
+	ExpectedStatus int               `yaml:"expected_status,omitempty"` // для HTTP
+	Headers        map[string]string `yaml:"headers,omitempty"`         // для HTTP
+
+	// Для DNS проверок
+	Host       string `yaml:"host,omitempty"`        // хост для DNS или TCP
+	RecordType string `yaml:"record_type,omitempty"` // A, AAAA, CNAME
+	Expected   string `yaml:"expected,omitempty"`    // ожидаемое значение (опционально)
+
+	// Для TCP проверок
+	Port    int    `yaml:"port,omitempty"`    // порт для TCP
+	Address string `yaml:"address,omitempty"` // полный адрес для TCP (альтернатива host:port)
+}
+
+func (e Endpoint) GetIdentifier() string {
+	switch strings.ToLower(e.Type) {
+	case "dns":
+		return fmt.Sprintf("dns://%s/%s", e.Host, e.RecordType)
+	case "tcp":
+		if e.Address != "" {
+			return fmt.Sprintf("tcp://%s", e.Address)
 		}
+		return fmt.Sprintf("tcp://%s:%d", e.Host, e.Port)
+	default: // http
+		return e.URL
 	}
-	
+}
+
+type ServiceState struct {
+	mu               sync.RWMutex
+	consecutiveFails int
+	isDown           bool
+	firstFailTime    time.Time
+	lastCheckTime    time.Time
+}
+
+type Monitor struct {
+	config         Config
+	monitorConfig  MonitorConfig
+	states         sync.Map
+	telegramToken  string
+	telegramChatID string
+	mattermostURL  string
+	httpClient     *http.Client
+	resolver       *net.Resolver
+	notifyQueue    chan *NotifyEvent
+	semaphore      chan struct{}
+	wg             sync.WaitGroup
+	eventPool      sync.Pool
+}
+
+type NotifyEvent struct {
+	endpoint  string
+	isDown    bool
+	timestamp time.Time
+	failTime  time.Time
+}
+
+type Notifier interface {
+	Send(ctx context.Context, message string) error
+	Name() string
+}
+
+type TelegramNotifier struct {
+	token      string
+	chatID     string
+	httpClient *http.Client
+}
+
+func (t *TelegramNotifier) Send(ctx context.Context, message string) error {
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", t.token)
+	payload := map[string]interface{}{
+		"chat_id":    t.chatID,
+		"text":       message,
+		"parse_mode": "Markdown",
+	}
+	return sendJSONRequest(ctx, t.httpClient, url, payload)
+}
+
+func (t *TelegramNotifier) Name() string {
+	return "Telegram"
+}
+
+type MattermostNotifier struct {
+	webhookURL string
+	httpClient *http.Client
+}
+
+func (m *MattermostNotifier) Send(ctx context.Context, message string) error {
+	payload := map[string]string{"text": message}
+	return sendJSONRequest(ctx, m.httpClient, m.webhookURL, payload)
+}
+
+func (m *MattermostNotifier) Name() string {
+	return "Mattermost"
+}
+
+func sendJSONRequest(ctx context.Context, client *http.Client, targetURL string, payload interface{}) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("do request: %w", err)
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			slog.Warn("failed to close response body", "error", cerr)
+		}
+	}()
+
+	limited := io.LimitReader(resp.Body, 1<<20)
+	if _, err := io.Copy(io.Discard, limited); err != nil {
+		return fmt.Errorf("drain body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
 	return nil
+}
+func maskSensitiveString(s string, showLast int) string {
+	if len(s) <= showLast {
+		return "***"
+	}
+	return strings.Repeat("*", len(s)-showLast) + s[len(s)-showLast:]
 }
 
 func sanitizeURL(rawURL string) string {
@@ -1096,164 +224,822 @@ func sanitizeURL(rawURL string) string {
 	}
 	parsed.RawQuery = ""
 	parsed.User = nil
-	parsed.Fragment = ""
 	return parsed.String()
 }
 
 func validateEndpoint(ep Endpoint) error {
-	if ep.Type == "" {
-		ep.Type = "http"
+	endpointType := strings.ToLower(ep.Type)
+	if endpointType == "" {
+		endpointType = "http"
 	}
-	
-	switch strings.ToLower(ep.Type) {
-	case "http", "https":
+
+	switch endpointType {
+	case "http":
 		if ep.URL == "" {
-			return errors.New("URL is required")
+			return errors.New("URL is required for HTTP endpoint")
 		}
-		return validateURL(ep.URL)
-		
+
+		parsed, err := url.Parse(ep.URL)
+		if err != nil {
+			return fmt.Errorf("invalid URL: %w", err)
+		}
+
+		if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			return fmt.Errorf("URL scheme must be http or https, got: %s", parsed.Scheme)
+		}
+
+		if parsed.Host == "" {
+			return errors.New("URL must have a host")
+		}
+
+		if ep.Method != "" {
+			method := strings.ToUpper(ep.Method)
+			validMethods := map[string]bool{
+				"GET": true, "POST": true, "PUT": true, "PATCH": true,
+				"DELETE": true, "HEAD": true, "OPTIONS": true,
+			}
+			if !validMethods[method] {
+				return fmt.Errorf("invalid HTTP method: %s", ep.Method)
+			}
+		}
+
+		if ep.ExpectedStatus != 0 && (ep.ExpectedStatus < 100 || ep.ExpectedStatus > 599) {
+			return fmt.Errorf("invalid expected status code: %d", ep.ExpectedStatus)
+		}
+
 	case "dns":
 		if ep.Host == "" {
-			return errors.New("host is required")
+			return errors.New("host is required for DNS endpoint")
 		}
-		if ep.RecordType == "" {
-			return errors.New("record_type is required")
+
+		recordType := strings.ToUpper(ep.RecordType)
+		if recordType == "" {
+			return errors.New("record_type is required for DNS endpoint")
 		}
+
 		validTypes := map[string]bool{"A": true, "AAAA": true, "CNAME": true}
-		if !validTypes[strings.ToUpper(ep.RecordType)] {
-			return fmt.Errorf("unsupported record type: %s", ep.RecordType)
+		if !validTypes[recordType] {
+			return fmt.Errorf("unsupported DNS record type: %s (supported: A, AAAA, CNAME)", recordType)
 		}
-		
+
+		if ep.Expected != "" {
+			switch recordType {
+			case "A":
+				if net.ParseIP(ep.Expected) == nil || !strings.Contains(ep.Expected, ".") {
+					return fmt.Errorf("invalid IPv4 address in expected: %s", ep.Expected)
+				}
+			case "AAAA":
+				if net.ParseIP(ep.Expected) == nil || !strings.Contains(ep.Expected, ":") {
+					return fmt.Errorf("invalid IPv6 address in expected: %s", ep.Expected)
+				}
+			case "CNAME":
+				ep.Expected = strings.TrimSuffix(ep.Expected, ".")
+			}
+		}
+
 	case "tcp":
 		if ep.Address == "" && ep.Host == "" {
-			return errors.New("address or host is required")
+			return errors.New("address or host is required for TCP endpoint")
 		}
+
 		if ep.Address == "" {
 			if ep.Port <= 0 || ep.Port > 65535 {
 				return fmt.Errorf("invalid port: %d", ep.Port)
 			}
+			ep.Address = fmt.Sprintf("%s:%d", ep.Host, ep.Port)
 		}
-		
+
+		if _, _, err := net.SplitHostPort(ep.Address); err != nil {
+			return fmt.Errorf("invalid TCP address: %w", err)
+		}
+
 	default:
-		return fmt.Errorf("unknown endpoint type: %s", ep.Type)
+		return fmt.Errorf("unsupported endpoint type: %s", ep.Type)
 	}
-	
+
 	return nil
 }
 
-// LoadConfig loads configuration from file
-func LoadConfig(path string) (*Config, error) {
-	// Limit config file size to prevent DoS
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, fmt.Errorf("stat config file: %w", err)
-	}
-	
-	if info.Size() > 10*1024*1024 { // 10MB limit
-		return nil, errors.New("config file too large")
-	}
-	
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read config: %w", err)
-	}
-	
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
-	}
-	
-	if len(cfg.Endpoints) == 0 {
-		return nil, errors.New("no endpoints configured")
-	}
-	
-	if len(cfg.Endpoints) > 1000 {
-		return nil, errors.New("too many endpoints (max 1000)")
-	}
-	
-	// Normalize endpoint types
-	for i := range cfg.Endpoints {
-		if cfg.Endpoints[i].Type == "" {
-			cfg.Endpoints[i].Type = "http"
-		}
-		cfg.Endpoints[i].Type = strings.ToLower(cfg.Endpoints[i].Type)
-	}
-	
-	return &cfg, nil
-}
-
 func main() {
-	// Setup structured logging
-	opts := &slog.HandlerOptions{
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
-		AddSource: false,
-	}
-	
-	if os.Getenv("DEBUG") == "true" {
-		opts.Level = slog.LevelDebug
-	}
-	
-	handler := slog.NewJSONHandler(os.Stdout, opts)
-	slog.SetDefault(slog.New(handler))
-	
-	// Log startup
-	slog.Info("starting monitor service",
-		"version", Version,
-		"go_version", runtime.Version(),
-		"pid", os.Getpid())
-	
-	// Run service
+	}))
+	slog.SetDefault(logger)
+
 	if err := run(); err != nil {
-		slog.Error("service failed", "error", err)
+		slog.Error("fatal error", "error", err)
 		os.Exit(1)
 	}
 }
 
 func run() error {
-	// Load monitor configuration
-	monitorConfig, err := LoadMonitorConfig()
-	if err != nil {
-		return fmt.Errorf("load monitor config: %w", err)
-	}
-	
-	// Load service configuration
-	configPath := os.Getenv("CONFIG_PATH")
-	if configPath == "" {
-		configPath = "config.yaml"
-	}
-	
-	config, err := LoadConfig(configPath)
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
-	
-	// Validate Telegram configuration
 	telegramToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	telegramChatID := os.Getenv("TELEGRAM_CHAT_ID")
-	
+	mattermostURL := os.Getenv("MATTERMOST_WEBHOOK_URL")
+
 	if telegramToken == "" || telegramChatID == "" {
-		return errors.New("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required")
+		return errors.New("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
 	}
-	
-	// Create monitor
-	monitor, err := NewMonitor(config, monitorConfig)
+
+	if !strings.Contains(telegramToken, ":") || len(telegramToken) < 20 {
+		return errors.New("TELEGRAM_BOT_TOKEN appears to be invalid")
+	}
+
+	if mattermostURL != "" {
+		parsed, err := url.Parse(mattermostURL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return fmt.Errorf("MATTERMOST_WEBHOOK_URL is invalid: %w", err)
+		}
+	}
+
+	configPath := "config.yaml"
+	if cp := os.Getenv("CONFIG_PATH"); cp != "" {
+		configPath = cp
+	}
+
+	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return fmt.Errorf("create monitor: %w", err)
+		return fmt.Errorf("read config: %w", err)
 	}
-	
-	// Add notifiers
-	monitor.AddNotifier(NewTelegramNotifier(telegramToken, telegramChatID))
-	
-	// Add Mattermost if configured
-	if mattermostURL := os.Getenv("MATTERMOST_WEBHOOK_URL"); mattermostURL != "" {
-		// TODO: Implement MattermostNotifier
-		slog.Info("mattermost webhook configured")
+
+	var config Config
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return fmt.Errorf("parse config: %w", err)
 	}
-	
-	// Setup signal handling
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	
-	// Start monitor
-	return monitor.Start(ctx)
+
+	if len(config.Endpoints) == 0 {
+		return errors.New("no endpoints configured")
+	}
+
+	for i, ep := range config.Endpoints {
+		if ep.Type == "" {
+			config.Endpoints[i].Type = "http"
+		}
+		config.Endpoints[i].Type = strings.ToLower(config.Endpoints[i].Type)
+
+		if err := validateEndpoint(config.Endpoints[i]); err != nil {
+			return fmt.Errorf("endpoint %d validation failed: %w", i, err)
+		}
+	}
+
+	slog.Info("loaded configuration", "endpoints", len(config.Endpoints))
+	for _, ep := range config.Endpoints {
+		logEndpoint(ep)
+	}
+
+	monitorConfig := loadMonitorConfig()
+	slog.Info("monitor configuration",
+		"check_interval", monitorConfig.checkInterval,
+		"request_timeout", monitorConfig.requestTimeout,
+		"retry_delay", monitorConfig.retryDelay,
+		"failure_threshold", monitorConfig.failureThreshold,
+		"notify_batch_window", monitorConfig.notifyBatchWindow,
+		"max_batch_size", monitorConfig.maxBatchSize,
+		"max_concurrent_checks", monitorConfig.maxConcurrentChecks,
+		"max_response_body_size", monitorConfig.maxResponseBodySize,
+		"dns_timeout", monitorConfig.dnsTimeout,
+		"tcp_timeout", monitorConfig.tcpTimeout,
+		"telegram_chat_id", maskSensitiveString(telegramChatID, 4),
+		"mattermost_enabled", mattermostURL != "")
+
+	httpClient := &http.Client{
+		Timeout: monitorConfig.requestTimeout,
+		Transport: &http.Transport{
+			MaxIdleConns:          20,
+			MaxIdleConnsPerHost:   2,
+			IdleConnTimeout:       30 * time.Second,
+			MaxConnsPerHost:       5,
+			DisableKeepAlives:     false,
+			DisableCompression:    false,
+			ResponseHeaderTimeout: 10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+
+	resolver := &net.Resolver{
+		PreferGo:     true,
+		StrictErrors: true,
+	}
+
+	notifiers := []Notifier{
+		&TelegramNotifier{
+			token:      telegramToken,
+			chatID:     telegramChatID,
+			httpClient: httpClient,
+		},
+	}
+
+	if mattermostURL != "" {
+		notifiers = append(notifiers, &MattermostNotifier{
+			webhookURL: mattermostURL,
+			httpClient: httpClient,
+		})
+		slog.Info("mattermost fallback enabled")
+	}
+
+	monitor := &Monitor{
+		config:         config,
+		monitorConfig:  monitorConfig,
+		telegramToken:  telegramToken,
+		telegramChatID: telegramChatID,
+		mattermostURL:  mattermostURL,
+		httpClient:     httpClient,
+		resolver:       resolver,
+		notifyQueue:    make(chan *NotifyEvent, 100),
+		semaphore:      make(chan struct{}, monitorConfig.maxConcurrentChecks),
+		eventPool: sync.Pool{
+			New: func() interface{} {
+				return &NotifyEvent{}
+			},
+		},
+	}
+	for _, ep := range config.Endpoints {
+		monitor.states.Store(ep.GetIdentifier(), &ServiceState{})
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	monitor.wg.Add(1)
+	go monitor.notificationWorker(ctx, notifiers)
+
+	monitor.wg.Add(1)
+	go monitor.memoryMonitor(ctx)
+
+	slog.Info("starting service monitor",
+		"interval", monitorConfig.checkInterval,
+		"gomaxprocs", runtime.GOMAXPROCS(0))
+
+	ticker := time.NewTicker(monitorConfig.checkInterval)
+	defer ticker.Stop()
+
+	slog.Info("running initial health check")
+	monitor.checkAllServices(ctx)
+	slog.Info("initial check completed")
+
+	for {
+		select {
+		case <-ticker.C:
+			monitor.checkAllServices(ctx)
+		case <-ctx.Done():
+			slog.Info("received shutdown signal, stopping gracefully")
+			close(monitor.notifyQueue)
+			monitor.wg.Wait()
+			slog.Info("shutdown complete")
+			return nil
+		}
+	}
+}
+
+func logEndpoint(ep Endpoint) {
+	switch ep.Type {
+	case "dns":
+		slog.Info("monitoring endpoint",
+			"type", "DNS",
+			"host", ep.Host,
+			"record_type", strings.ToUpper(ep.RecordType),
+			"has_expected", ep.Expected != "")
+	case "tcp":
+		addr := ep.Address
+		if addr == "" {
+			addr = fmt.Sprintf("%s:%d", ep.Host, ep.Port)
+		}
+		slog.Info("monitoring endpoint",
+			"type", "TCP",
+			"address", addr)
+	default: // http
+		method := ep.Method
+		if method == "" {
+			method = http.MethodGet
+		}
+		expectedStatus := ep.ExpectedStatus
+		if expectedStatus == 0 {
+			expectedStatus = http.StatusOK
+		}
+		slog.Info("monitoring endpoint",
+			"type", "HTTP",
+			"url", sanitizeURL(ep.URL),
+			"method", method,
+			"expected_status", expectedStatus,
+			"has_custom_headers", len(ep.Headers) > 0)
+	}
+}
+
+func (m *Monitor) memoryMonitor(ctx context.Context) {
+	defer m.wg.Done()
+
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	var memStats runtime.MemStats
+
+	for {
+		select {
+		case <-ticker.C:
+			runtime.ReadMemStats(&memStats)
+			slog.Info("memory stats",
+				"alloc_mb", memStats.Alloc/1024/1024,
+				"sys_mb", memStats.Sys/1024/1024,
+				"num_gc", memStats.NumGC,
+				"goroutines", runtime.NumGoroutine())
+
+			if memStats.Alloc > 500*1024*1024 {
+				slog.Warn("high memory usage detected", "alloc_mb", memStats.Alloc/1024/1024)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (m *Monitor) checkAllServices(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	var wg sync.WaitGroup
+	startTime := time.Now()
+
+	for _, ep := range m.config.Endpoints {
+		wg.Add(1)
+		go func(endpoint Endpoint) {
+			defer wg.Done()
+
+			select {
+			case m.semaphore <- struct{}{}:
+				defer func() { <-m.semaphore }()
+				m.checkService(ctx, endpoint)
+			case <-ctx.Done():
+				return
+			}
+		}(ep)
+	}
+	wg.Wait()
+
+	duration := time.Since(startTime)
+	slog.Debug("health check cycle completed", "duration", duration.Round(time.Millisecond))
+}
+
+func (m *Monitor) checkService(ctx context.Context, ep Endpoint) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	identifier := ep.GetIdentifier()
+	success := m.performCheck(ctx, ep)
+
+	if !success && ctx.Err() == nil {
+		retryCtx, cancel := context.WithTimeout(ctx, m.monitorConfig.retryDelay+m.monitorConfig.requestTimeout)
+		defer cancel()
+
+		time.Sleep(m.monitorConfig.retryDelay)
+		success = m.performCheck(retryCtx, ep)
+	}
+
+	m.updateState(identifier, success)
+}
+
+func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
+	switch ep.Type {
+	case "dns":
+		return m.performDNSCheck(ctx, ep)
+	case "tcp":
+		return m.performTCPCheck(ctx, ep)
+	default:
+		return m.performHTTPCheck(ctx, ep)
+	}
+}
+
+func (m *Monitor) performDNSCheck(ctx context.Context, ep Endpoint) bool {
+	recordType := strings.ToUpper(ep.RecordType)
+	startTime := time.Now()
+
+	dnsCtx, cancel := context.WithTimeout(ctx, m.monitorConfig.dnsTimeout)
+	defer cancel()
+
+	var success bool
+	var resultStr string
+
+	switch recordType {
+	case "A":
+		ips, err := m.resolver.LookupIPAddr(dnsCtx, ep.Host)
+		if err != nil {
+			slog.Warn("DNS A lookup failed",
+				"host", ep.Host,
+				"error", err)
+			return false
+		}
+
+		var ipv4s []string
+		for _, ip := range ips {
+			if ip.IP.To4() != nil {
+				ipv4s = append(ipv4s, ip.IP.String())
+			}
+		}
+
+		if len(ipv4s) == 0 {
+			slog.Warn("DNS A lookup returned no IPv4 addresses", "host", ep.Host)
+			return false
+		}
+
+		resultStr = strings.Join(ipv4s, ", ")
+
+		if ep.Expected != "" {
+			success = false
+			for _, ip := range ipv4s {
+				if ip == ep.Expected {
+					success = true
+					break
+				}
+			}
+			if !success {
+				slog.Warn("DNS A record mismatch",
+					"host", ep.Host,
+					"expected", ep.Expected,
+					"got", resultStr)
+				return false
+			}
+		} else {
+			success = true
+		}
+
+	case "AAAA":
+		ips, err := m.resolver.LookupIPAddr(dnsCtx, ep.Host)
+		if err != nil {
+			slog.Warn("DNS AAAA lookup failed",
+				"host", ep.Host,
+				"error", err)
+			return false
+		}
+
+		var ipv6s []string
+		for _, ip := range ips {
+			if ip.IP.To4() == nil && ip.IP.To16() != nil {
+				ipv6s = append(ipv6s, ip.IP.String())
+			}
+		}
+
+		if len(ipv6s) == 0 {
+			slog.Warn("DNS AAAA lookup returned no IPv6 addresses", "host", ep.Host)
+			return false
+		}
+
+		resultStr = strings.Join(ipv6s, ", ")
+
+		if ep.Expected != "" {
+			success = false
+			for _, ip := range ipv6s {
+				if ip == ep.Expected {
+					success = true
+					break
+				}
+			}
+			if !success {
+				slog.Warn("DNS AAAA record mismatch",
+					"host", ep.Host,
+					"expected", ep.Expected,
+					"got", resultStr)
+				return false
+			}
+		} else {
+			success = true
+		}
+
+	case "CNAME":
+		cname, err := m.resolver.LookupCNAME(dnsCtx, ep.Host)
+		if err != nil {
+			slog.Warn("DNS CNAME lookup failed",
+				"host", ep.Host,
+				"error", err)
+			return false
+		}
+
+		cname = strings.TrimSuffix(cname, ".")
+		resultStr = cname
+
+		if ep.Expected != "" {
+			expected := strings.TrimSuffix(ep.Expected, ".")
+			if cname != expected {
+				slog.Warn("DNS CNAME record mismatch",
+					"host", ep.Host,
+					"expected", expected,
+					"got", cname)
+				return false
+			}
+		}
+		success = true
+	}
+
+	if success {
+		duration := time.Since(startTime)
+		slog.Debug("DNS check successful",
+			"host", ep.Host,
+			"type", recordType,
+			"result", resultStr,
+			"duration", duration.Round(time.Millisecond))
+	}
+
+	return success
+}
+
+func (m *Monitor) performTCPCheck(ctx context.Context, ep Endpoint) bool {
+	address := ep.Address
+	if address == "" {
+		address = fmt.Sprintf("%s:%d", ep.Host, ep.Port)
+	}
+
+	startTime := time.Now()
+
+	d := net.Dialer{
+		Timeout: m.monitorConfig.tcpTimeout,
+	}
+
+	conn, err := d.DialContext(ctx, "tcp", address)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false
+		}
+		slog.Warn("TCP connection failed",
+			"address", address,
+			"error", err)
+		return false
+	}
+
+	if err := conn.Close(); err != nil {
+		slog.Warn("failed to close TCP connection",
+			"address", address,
+			"error", err)
+	}
+
+	duration := time.Since(startTime)
+	slog.Debug("TCP check successful",
+		"address", address,
+		"duration", duration.Round(time.Millisecond))
+
+	return true
+}
+
+func (m *Monitor) performHTTPCheck(ctx context.Context, ep Endpoint) bool {
+	method := ep.Method
+	if method == "" {
+		method = http.MethodGet
+	}
+
+	expectedStatus := ep.ExpectedStatus
+	if expectedStatus == 0 {
+		expectedStatus = http.StatusOK
+	}
+
+	startTime := time.Now()
+	req, err := http.NewRequestWithContext(ctx, method, ep.URL, nil)
+	if err != nil {
+		slog.Error("failed to create request",
+			"url", sanitizeURL(ep.URL),
+			"error", err)
+		return false
+	}
+
+	for k, v := range ep.Headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false
+		}
+		slog.Warn("request failed",
+			"url", sanitizeURL(ep.URL),
+			"error", err)
+		return false
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			slog.Warn("failed to close response body",
+				"url", sanitizeURL(ep.URL),
+				"error", cerr)
+		}
+	}()
+
+	limited := io.LimitReader(resp.Body, m.monitorConfig.maxResponseBodySize)
+	written, err := io.Copy(io.Discard, limited)
+	if err != nil {
+		slog.Warn("failed to drain response body",
+			"url", sanitizeURL(ep.URL),
+			"error", err)
+	}
+
+	if written >= m.monitorConfig.maxResponseBodySize {
+		slog.Warn("response body truncated",
+			"url", sanitizeURL(ep.URL),
+			"size", written,
+			"limit", m.monitorConfig.maxResponseBodySize)
+	}
+
+	if resp.StatusCode != expectedStatus {
+		slog.Warn("unexpected status",
+			"url", sanitizeURL(ep.URL),
+			"status", resp.StatusCode,
+			"expected", expectedStatus)
+		return false
+	}
+
+	duration := time.Since(startTime)
+	slog.Debug("HTTP check successful",
+		"url", sanitizeURL(ep.URL),
+		"status", resp.StatusCode,
+		"response_size", written,
+		"duration", duration.Round(time.Millisecond))
+	return true
+}
+
+func (m *Monitor) updateState(identifier string, success bool) {
+	val, ok := m.states.Load(identifier)
+	if !ok {
+		slog.Error("state not found for identifier", "id", identifier)
+		return
+	}
+	state := val.(*ServiceState)
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	now := time.Now()
+	state.lastCheckTime = now
+
+	if success {
+		if state.isDown {
+			event := m.eventPool.Get().(*NotifyEvent)
+			event.endpoint = identifier
+			event.isDown = false
+			event.timestamp = now
+			event.failTime = state.firstFailTime
+
+			select {
+			case m.notifyQueue <- event:
+			default:
+				slog.Warn("notification queue full, dropping recovery event",
+					"id", identifier)
+				m.eventPool.Put(event)
+			}
+
+			state.isDown = false
+			state.consecutiveFails = 0
+			state.firstFailTime = time.Time{}
+		} else {
+			state.consecutiveFails = 0
+		}
+	} else {
+		state.consecutiveFails++
+		if state.consecutiveFails == 1 {
+			state.firstFailTime = now
+		}
+
+		if state.consecutiveFails >= m.monitorConfig.failureThreshold && !state.isDown {
+			state.isDown = true
+
+			event := m.eventPool.Get().(*NotifyEvent)
+			event.endpoint = identifier
+			event.isDown = true
+			event.timestamp = now
+			event.failTime = state.firstFailTime
+
+			select {
+			case m.notifyQueue <- event:
+			default:
+				slog.Warn("notification queue full, dropping failure event",
+					"id", identifier)
+				m.eventPool.Put(event)
+			}
+		}
+	}
+}
+
+func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) {
+	defer m.wg.Done()
+
+	batch := make([]*NotifyEvent, 0, m.monitorConfig.maxBatchSize)
+	timer := time.NewTimer(m.monitorConfig.notifyBatchWindow)
+	timer.Stop()
+
+	flush := func() {
+		if len(batch) > 0 {
+			m.sendBatchNotification(ctx, batch, notifiers)
+			for _, event := range batch {
+				m.eventPool.Put(event)
+			}
+			batch = batch[:0]
+		}
+	}
+
+	for {
+		select {
+		case event, ok := <-m.notifyQueue:
+			if !ok {
+				timer.Stop()
+				flush()
+				return
+			}
+
+			batch = append(batch, event)
+
+			if len(batch) >= m.monitorConfig.maxBatchSize {
+				timer.Stop()
+				flush()
+			} else if len(batch) == 1 {
+				timer.Reset(m.monitorConfig.notifyBatchWindow)
+			}
+
+		case <-timer.C:
+			flush()
+
+		case <-ctx.Done():
+			timer.Stop()
+			flush()
+			return
+		}
+	}
+}
+
+func (m *Monitor) sendBatchNotification(ctx context.Context, events []*NotifyEvent, notifiers []Notifier) {
+	if len(events) == 0 {
+		return
+	}
+
+	downServices := make([]string, 0, len(events))
+	upServices := make([]string, 0, len(events))
+	downDetails := make(map[string]time.Time, len(events))
+	upDetails := make(map[string]time.Time, len(events))
+
+	for _, e := range events {
+		if e.isDown {
+			downServices = append(downServices, e.endpoint)
+			downDetails[e.endpoint] = e.failTime
+		} else {
+			upServices = append(upServices, e.endpoint)
+			upDetails[e.endpoint] = e.failTime
+		}
+	}
+
+	estimatedSize := 0
+	if len(downServices) > 0 {
+		estimatedSize += 25
+		for _, svc := range downServices {
+			estimatedSize += len(svc) + 40
+		}
+	}
+	if len(upServices) > 0 {
+		estimatedSize += 30
+		for _, svc := range upServices {
+			estimatedSize += len(svc) + 50
+		}
+	}
+
+	var sb strings.Builder
+	sb.Grow(estimatedSize)
+
+	if len(downServices) > 0 {
+		sb.WriteString("🔴 *Services DOWN:*\n")
+		for _, svc := range downServices {
+			sb.WriteString("• ")
+			sb.WriteString(svc)
+			sb.WriteString("\n  Failed at: ")
+			sb.WriteString(downDetails[svc].Format("2006-01-02 15:04:05"))
+			sb.WriteString("\n")
+		}
+	}
+
+	if len(upServices) > 0 {
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("✅ *Services RECOVERED:*\n")
+		for _, svc := range upServices {
+			failTime := upDetails[svc]
+			duration := time.Since(failTime).Round(time.Second)
+			sb.WriteString("• ")
+			sb.WriteString(svc)
+			sb.WriteString("\n  Downtime: ")
+			sb.WriteString(duration.String())
+			sb.WriteString("\n")
+		}
+	}
+
+	msg := sb.String()
+
+	notifyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	for _, notifier := range notifiers {
+		if err := notifier.Send(notifyCtx, msg); err != nil {
+			slog.Warn("notification failed",
+				"notifier", notifier.Name(),
+				"error", err)
+			continue
+		}
+		slog.Info("notification sent", "notifier", notifier.Name())
+		return
+	}
+
+	slog.Error("failed to send notification through all channels")
 }
