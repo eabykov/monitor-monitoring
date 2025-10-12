@@ -1,4 +1,4 @@
-module github.com/company/service-monitor
+module github.com/eabykov/monitor-monitoring
 
 go 1.25
 
