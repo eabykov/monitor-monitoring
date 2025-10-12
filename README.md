@@ -1,108 +1,250 @@
 # Monitor Monitoring [![Go Report Card](https://goreportcard.com/badge/github.com/eabykov/monitor-monitoring)](https://goreportcard.com/report/github.com/eabykov/monitor-monitoring) ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/eabykov/monitor-monitoring) ![License](https://img.shields.io/github/license/eabykov/monitor-monitoring)
 
-A lightweight, concurrent HTTP(S) service monitor written in Go. It continuously checks configured endpoints, batches state changes, and sends **Telegram** alerts (with optional **Mattermost** fallback) whenever a service goes **DOWN** or **RECOVERED**.
+The ultimate vigilant guardian for your infrastructure. Monitor Monitoring doesn't just check your services – it obsesses over them, delivering instant Telegram alerts the moment something goes sideways. Whether it's HTTP endpoints gasping for air, DNS records vanishing into the digital ether, or TCP ports slamming shut, this lightning-fast Go warrior catches it all before your users even know something's wrong.
 
 ## ✨ Features
 
-| Feature | Description |
-|-|-|
-| ⚡ **Concurrent checks** | All endpoints are checked in parallel |
-| 🔄 **Automatic retry** | Failed checks are retried once after a configurable delay |
-| 📊 **Batching & de-duplication** | Notifications are batched per window to avoid spam |
-| 📱 **Telegram** | Native Markdown alerts via Telegram Bot API |
-| 🦝 **Mattermost fallback** | Optional webhook fallback if Telegram fails |
-| 🛠️ **12-factor config** | Environment variables for runtime tuning |
-| 🧘 **Graceful shutdown** | Handles `SIGINT`/`SIGTERM` cleanly |
-| 🪵 **Structured logging** | JSON-ish logs via `slog` |
+- ⚡ **Blazing concurrent checks** - All endpoints monitored in parallel with configurable concurrency limits
+- 🌐 **Multi-protocol mastery** - HTTP/HTTPS, DNS (A/AAAA/CNAME), and TCP monitoring in one unified tool
+- 🎯 **Smart failure detection** - Configurable failure thresholds with automatic retry logic
+- 📱 **Instant Telegram alerts** - Rich Markdown notifications with downtime tracking and recovery reports
+- 🦝 **Mattermost fallback** - Redundant notification channels ensure you never miss critical alerts
+- 📊 **Intelligent batching** - Anti-spam protection with configurable batch windows and size limits
+- 🛡️ **Production-hardened** - Memory monitoring, graceful shutdown, structured logging, and resource optimization
+- 🔧 **Zero-config deployment** - Environment variable configuration following 12-factor app principles
+- 🔄 **Smart retry mechanism** - Failed checks get a second chance with configurable delays
+- 📈 **Built-in observability** - Memory usage tracking, performance metrics, and detailed debug logging
 
 ## 🚀 Quick Start
 
-### 1. Get the binary
+### 1. Create Telegram Bot
 
+**Create your monitoring bot:**
+1. Open Telegram and message [@BotFather](https://t.me/BotFather)
+2. Send `/newbot` command
+3. Choose a name and username for your bot
+4. **Save the bot token** (format: `123456789:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`)
+
+**Get your chat ID:**
+- **Option A**: Add [@userinfobot](https://t.me/userinfobot) to your group/channel, then send any message
+- **Option B**: Send a test message to your bot, then visit:
+  ```
+  https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates
+  ```
+  Look for `"chat":{"id":-1001234567890}` in the response
+
+**Add bot to your channel/group:**
+- Add your bot as an administrator to receive notifications
+
+### 2. Install Monitor Monitoring
+
+**Download and build:**
 ```bash
-# Clone
 git clone https://github.com/eabykov/monitor-monitoring.git
 cd monitor-monitoring
-
-# Build
 go build -o monitor-monitoring .
 ```
 
-### 2. Create a Telegram bot
+**Or install directly:**
+```bash
+go install github.com/eabykov/monitor-monitoring@latest
+```
 
-1. Message [@BotFather](https://t.me/botfather) → `/newbot`  
-2. Save the token  
-3. Add the bot to your channel/group  
-4. Get chat ID:  
-   `https://api.telegram.org/bot<TOKEN>/getUpdates`  
-   (or use [@userinfobot](https://t.me/userinfobot))
+### 3. Configure Your Endpoints
 
-### 3. Minimal `config.yaml`
-
+Create `config.yaml`:
 ```yaml
 endpoints:
+  # Quick HTTP check
   - url: https://api.github.com
+    type: http
     method: GET
     expected_status: 200
 ```
 
-### 4. Run
+### 4. Set Environment Variables
 
 ```bash
-export TELEGRAM_BOT_TOKEN="123456:ABC-DEF..."
+export TELEGRAM_BOT_TOKEN="123456789:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
 export TELEGRAM_CHAT_ID="-1001234567890"
+```
+
+### 5. Launch Your Monitor
+
+```bash
 ./monitor-monitoring
+```
+
+**Expected output:**
+```
+2024/01/15 14:30:25 INFO loaded configuration endpoints=1
+2024/01/15 14:30:25 INFO monitoring endpoint type=HTTP url=https://api.github.com method=GET expected_status=200 has_custom_headers=false
+2024/01/15 14:30:25 INFO starting service monitor interval=1m0s gomaxprocs=8
 ```
 
 ## ⚙️ Configuration
 
-### Environment variables
+### Environment Variables
 
-| Variable | Default | Purpose |
-|-|-|-|
-| `CHECK_INTERVAL` | `1m` | How often to probe all endpoints |
-| `REQUEST_TIMEOUT` | `45s` | HTTP client timeout per check |
-| `RETRY_DELAY` | `5s` | Wait before retrying a failed check |
-| `FAILURE_THRESHOLD` | `3` | Consecutive failures to mark DOWN |
-| `NOTIFY_BATCH_WINDOW` | `10s` | Max time to wait before sending a batch |
-| `CONFIG_PATH` | `config.yaml` | Path to YAML endpoint list |
-| `MATTERMOST_WEBHOOK_URL` | *empty* | Webhook URL for fallback notifications |
+| Variable | Default | Required | Description |
+|----------|---------|----------|-------------|
+| `TELEGRAM_BOT_TOKEN` | - | **Yes** | Your Telegram bot token from @BotFather |
+| `TELEGRAM_CHAT_ID` | - | **Yes** | Chat ID where notifications will be sent |
+| `CHECK_INTERVAL` | `1m` | No | How often to check all endpoints |
+| `REQUEST_TIMEOUT` | `45s` | No | HTTP request timeout per check |
+| `RETRY_DELAY` | `5s` | No | Wait time before retrying failed checks |
+| `FAILURE_THRESHOLD` | `3` | No | Consecutive failures before marking service DOWN |
+| `NOTIFY_BATCH_WINDOW` | `10s` | No | Maximum time to wait before sending notification batch |
+| `MAX_BATCH_SIZE` | `50` | No | Maximum number of notifications in one batch |
+| `MAX_CONCURRENT_CHECKS` | `10` | No | Maximum parallel health checks |
+| `MAX_RESPONSE_BODY_SIZE` | `1048576` | No | Maximum HTTP response body size in bytes (1MB) |
+| `DNS_TIMEOUT` | `5s` | No | Timeout for DNS queries |
+| `TCP_TIMEOUT` | `10s` | No | Timeout for TCP connection attempts |
+| `CONFIG_PATH` | `config.yaml` | No | Path to YAML configuration file |
+| `MATTERMOST_WEBHOOK_URL` | - | No | Mattermost webhook URL for fallback notifications |
 
-### YAML schema (`config.yaml`)
+### YAML Schema (`config.yaml`)
+
+#### HTTP/HTTPS Endpoints
+Monitor web services, APIs, and websites:
 
 ```yaml
 endpoints:
-  - url: https://example.com/health
-    method: GET              # optional, defaults to GET
-    expected_status: 200     # optional, defaults to 200
-    headers:                 # optional
-      Authorization: Bearer
+  # Basic HTTP check
+  - url: https://example.com
+    type: http                    # Optional: defaults to 'http'
+    method: GET                   # Optional: GET, POST, PUT, DELETE, HEAD, PATCH, OPTIONS
+    expected_status: 200          # Optional: defaults to 200
+    
+  # API with authentication
+  - url: https://api.example.com/health
+    type: http
+    method: GET
+    expected_status: 200
+    headers:                      # Optional: custom headers
+      Authorization: Bearer your-token-here
+      Accept: application/json
+      User-Agent: monitor-monitoring/1.0
+      
+  # POST endpoint check
+  - url: https://api.example.com/webhook
+    type: http
+    method: POST
+    expected_status: 201
+    headers:
+      Content-Type: application/json
 ```
 
-## 🔍 Troubleshooting
+#### DNS Monitoring
+Verify DNS resolution and validate records:
 
-| Symptom | Fix |
-|-|-|
-| `TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set` | Export both variables |
-| Telegram messages not arriving | Check bot is in channel and chat ID is correct |
-| `context deadline exceeded` | Increase `REQUEST_TIMEOUT` |
-| High memory usage | Lower `MaxIdleConnsPerHost` in code or switch to `fasthttp` fork |
+```yaml
+endpoints:
+  # Basic A record check
+  - type: dns
+    host: example.com             # Required: hostname to resolve
+    record_type: A                # Required: A, AAAA, or CNAME
+    
+  # A record with validation
+  - type: dns
+    host: api.example.com
+    record_type: A
+    expected: 192.168.1.100       # Optional: validate specific IP
+    
+  # IPv6 AAAA record
+  - type: dns
+    host: ipv6.example.com
+    record_type: AAAA
+    expected: 2001:db8::1         # Optional: validate specific IPv6
+    
+  # CNAME record check
+  - type: dns
+    host: www.example.com
+    record_type: CNAME
+    expected: example.com         # Optional: validate CNAME target
+    
+  # Multiple DNS servers check
+  - type: dns
+    host: google.com
+    record_type: A                # Will resolve to multiple IPs
+    
+  # Cloudflare DNS check
+  - type: dns
+    host: one.one.one.one
+    record_type: A
+    expected: 1.1.1.1
+```
 
-## 🤝 Contributing
+#### TCP Port Monitoring
+Check network service availability:
 
-1. Fork the repo  
-2. Create a feature branch (`git checkout -b feat/amazing`)  
-3. Commit with [conventional messages](https://www.conventionalcommits.org)  
-4. Push and open a Pull Request  
-5. Ensure CI passes (`golangci-lint run`, `go test`, `go mod tidy`)
+```yaml
+endpoints:
+  # Database connection
+  - type: tcp
+    host: db.example.com          # Required: hostname
+    port: 5432                    # Required: port number
+    
+  # Alternative address format
+  - type: tcp
+    address: "database.company.com:5432"  # Alternative: full address
+    
+  # Web server
+  - type: tcp
+    host: web.example.com
+    port: 443
+    
+  # SMTP server
+  - type: tcp
+    host: mail.example.com
+    port: 587
+    
+  # Redis cache
+  - type: tcp
+    address: "redis.example.com:6379"
+    
+  # Custom application
+  - type: tcp
+    host: app.example.com
+    port: 8080
+```
 
-## 📄 License
+#### Mixed Configuration Example
+Real-world monitoring setup:
 
-MIT © [eabykov](https://github.com/eabykov)
-
-## 🔗 Links
-
-| Resource | URL |
-|-|-|
-| 🐛 Issues | https://github.com/eabykov/monitor-monitoring/issues |
-| 💬 Discussions | https://github.com/eabykov/monitor-monitoring/discussions |
+```yaml
+endpoints:
+  # Frontend website
+  - url: https://www.company.com
+    type: http
+    method: GET
+    expected_status: 200
+    
+  # API health endpoint
+  - url: https://api.company.com/health
+    type: http
+    expected_status: 200
+    headers:
+      Authorization: Bearer monitoring-token
+      
+  # Database connectivity
+  - type: tcp
+    host: prod-db.company.com
+    port: 5432
+    
+  # DNS resolution
+  - type: dns
+    host: company.com
+    record_type: A
+    expected: 203.0.113.10
+    
+  # CDN endpoint
+  - url: https://cdn.company.com/status
+    type: http
+    expected_status: 200
+    
+  # Email server
+  - type: tcp
+    host: smtp.company.com
+    port: 587
+```
