@@ -1,51 +1,66 @@
 endpoints:
-  # Mattermost
-  - url: https://mattermost.company.com/api/v4/system/ping
+  # ============================================
+  # WORKING EXAMPLES (5)
+  # ============================================
+  
+  # 1. HTTP - Google homepage
+  - url: https://www.google.com
+    type: http
     method: GET
     expected_status: 200
-
-  # Grafana
-  - url: https://grafana.company.com/api/health
-    method: GET
-    expected_status: 200
-
-  # VictoriaMetrics
-  - url: https://victoria.company.com/health
-    method: GET
-    expected_status: 200
-
-  # Kubernetes API
-  - url: https://k8s.company.com/healthz
+  
+  # 2. HTTP - GitHub API
+  - url: https://api.github.com
+    type: http
     method: GET
     expected_status: 200
     headers:
-      Authorization: "Bearer your-k8s-token"
-
-  # Redmine
-  - url: https://redmine.company.com
+      Accept: application/vnd.github.v3+json
+  
+  # 3. DNS - Google A record
+  - type: dns
+    host: google.com
+    record_type: A
+  
+  # 4. DNS - Cloudflare DNS (1.1.1.1)
+  - type: dns
+    host: one.one.one.one
+    record_type: A
+    expected: 1.1.1.1
+  
+  # 5. TCP - Google DNS
+  - type: tcp
+    host: 8.8.8.8
+    port: 53
+  
+  # ============================================
+  # FAILING EXAMPLES (5)
+  # ============================================
+  
+  # 6. HTTP - Non-existent domain
+  - url: https://this-domain-definitely-does-not-exist-12345.com
+    type: http
     method: GET
     expected_status: 200
-
-  # Confluence
-  - url: https://confluence.company.com/status
+  
+  # 7. HTTP - Wrong status code expected
+  - url: https://httpstat.us/404
+    type: http
     method: GET
     expected_status: 200
-
-  # VPN Gateway
-  - url: https://vpn.company.com/health
-    method: GET
-    expected_status: 200
-
-  # Custom API with authentication
-  - url: https://api.company.com/v1/health
-    method: GET
-    expected_status: 200
-    headers:
-      X-API-Key: "your-api-key"
-      User-Agent: "ServiceMonitor/1.0"
-
-  # Service with POST check
-  - url: https://service.company.com/healthcheck
-    method: POST
-    expected_status: 204
-
+  
+  # 8. DNS - Non-existent host
+  - type: dns
+    host: nonexistent-host-that-will-fail-12345.com
+    record_type: A
+  
+  # 9. DNS - Wrong expected IP
+  - type: dns
+    host: google.com
+    record_type: A
+    expected: 192.0.2.1
+  
+  # 10. TCP - Closed port
+  - type: tcp
+    host: google.com
+    port: 9999
