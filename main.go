@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,6 +32,8 @@ type MonitorConfig struct {
 	maxBatchSize        int
 	maxConcurrentChecks int
 	maxResponseBodySize int64
+	dnsTimeout          time.Duration
+	tcpTimeout          time.Duration
 }
 
 func loadMonitorConfig() MonitorConfig {
@@ -43,6 +46,8 @@ func loadMonitorConfig() MonitorConfig {
 		maxBatchSize:        getEnvInt("MAX_BATCH_SIZE", 50),
 		maxConcurrentChecks: getEnvInt("MAX_CONCURRENT_CHECKS", 10),
 		maxResponseBodySize: int64(getEnvInt("MAX_RESPONSE_BODY_SIZE", 1048576)), // 1MB
+		dnsTimeout:          getEnvDuration("DNS_TIMEOUT", 5*time.Second),
+		tcpTimeout:          getEnvDuration("TCP_TIMEOUT", 10*time.Second),
 	}
 }
 
@@ -74,10 +79,35 @@ type Config struct {
 }
 
 type Endpoint struct {
-	URL            string            `yaml:"url"`
-	Method         string            `yaml:"method,omitempty"`
-	ExpectedStatus int               `yaml:"expected_status,omitempty"`
-	Headers        map[string]string `yaml:"headers,omitempty"`
+	URL            string            `yaml:"url,omitempty"`      // для HTTP проверок
+	Type           string            `yaml:"type,omitempty"`      // http, dns, tcp
+	Method         string            `yaml:"method,omitempty"`    // для HTTP
+	ExpectedStatus int               `yaml:"expected_status,omitempty"` // для HTTP
+	Headers        map[string]string `yaml:"headers,omitempty"`   // для HTTP
+	
+	// Для DNS проверок
+	Host       string `yaml:"host,omitempty"`        // хост для DNS или TCP
+	RecordType string `yaml:"record_type,omitempty"` // A, AAAA, CNAME
+	Expected   string `yaml:"expected,omitempty"`    // ожидаемое значение (опционально)
+	
+	// Для TCP проверок
+	Port    int    `yaml:"port,omitempty"`    // порт для TCP
+	Address string `yaml:"address,omitempty"` // полный адрес для TCP (альтернатива host:port)
+}
+
+// GetIdentifier возвращает уникальный идентификатор для endpoint
+func (e Endpoint) GetIdentifier() string {
+	switch strings.ToLower(e.Type) {
+	case "dns":
+		return fmt.Sprintf("dns://%s/%s", e.Host, e.RecordType)
+	case "tcp":
+		if e.Address != "" {
+			return fmt.Sprintf("tcp://%s", e.Address)
+		}
+		return fmt.Sprintf("tcp://%s:%d", e.Host, e.Port)
+	default: // http
+		return e.URL
+	}
 }
 
 // ServiceState использует RWMutex для оптимизации чтения
@@ -97,6 +127,7 @@ type Monitor struct {
 	telegramChatID string
 	mattermostURL  string
 	httpClient     *http.Client
+	resolver       *net.Resolver // для DNS проверок
 	notifyQueue    chan *NotifyEvent
 	semaphore      chan struct{}
 	wg             sync.WaitGroup
@@ -209,38 +240,100 @@ func sanitizeURL(rawURL string) string {
 
 // validateEndpoint валидирует endpoint перед использованием
 func validateEndpoint(ep Endpoint) error {
-	if ep.URL == "" {
-		return errors.New("URL is required")
+	endpointType := strings.ToLower(ep.Type)
+	if endpointType == "" {
+		endpointType = "http"
 	}
 
-	parsed, err := url.Parse(ep.URL)
-	if err != nil {
-		return fmt.Errorf("invalid URL: %w", err)
-	}
-
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return fmt.Errorf("URL scheme must be http or https, got: %s", parsed.Scheme)
-	}
-
-	if parsed.Host == "" {
-		return errors.New("URL must have a host")
-	}
-
-	// Проверяем метод
-	if ep.Method != "" {
-		method := strings.ToUpper(ep.Method)
-		validMethods := map[string]bool{
-			"GET": true, "POST": true, "PUT": true, "PATCH": true,
-			"DELETE": true, "HEAD": true, "OPTIONS": true,
+	switch endpointType {
+	case "http":
+		if ep.URL == "" {
+			return errors.New("URL is required for HTTP endpoint")
 		}
-		if !validMethods[method] {
-			return fmt.Errorf("invalid HTTP method: %s", ep.Method)
-		}
-	}
 
-	// Проверяем expected status
-	if ep.ExpectedStatus != 0 && (ep.ExpectedStatus < 100 || ep.ExpectedStatus > 599) {
-		return fmt.Errorf("invalid expected status code: %d", ep.ExpectedStatus)
+		parsed, err := url.Parse(ep.URL)
+		if err != nil {
+			return fmt.Errorf("invalid URL: %w", err)
+		}
+
+		if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			return fmt.Errorf("URL scheme must be http or https, got: %s", parsed.Scheme)
+		}
+
+		if parsed.Host == "" {
+			return errors.New("URL must have a host")
+		}
+
+		// Проверяем метод
+		if ep.Method != "" {
+			method := strings.ToUpper(ep.Method)
+			validMethods := map[string]bool{
+				"GET": true, "POST": true, "PUT": true, "PATCH": true,
+				"DELETE": true, "HEAD": true, "OPTIONS": true,
+			}
+			if !validMethods[method] {
+				return fmt.Errorf("invalid HTTP method: %s", ep.Method)
+			}
+		}
+
+		// Проверяем expected status
+		if ep.ExpectedStatus != 0 && (ep.ExpectedStatus < 100 || ep.ExpectedStatus > 599) {
+			return fmt.Errorf("invalid expected status code: %d", ep.ExpectedStatus)
+		}
+
+	case "dns":
+		if ep.Host == "" {
+			return errors.New("host is required for DNS endpoint")
+		}
+
+		recordType := strings.ToUpper(ep.RecordType)
+		if recordType == "" {
+			return errors.New("record_type is required for DNS endpoint")
+		}
+
+		validTypes := map[string]bool{"A": true, "AAAA": true, "CNAME": true}
+		if !validTypes[recordType] {
+			return fmt.Errorf("unsupported DNS record type: %s (supported: A, AAAA, CNAME)", recordType)
+		}
+
+		// Валидация expected если задано
+		if ep.Expected != "" {
+			switch recordType {
+			case "A":
+				if net.ParseIP(ep.Expected) == nil || !strings.Contains(ep.Expected, ".") {
+					return fmt.Errorf("invalid IPv4 address in expected: %s", ep.Expected)
+				}
+			case "AAAA":
+				if net.ParseIP(ep.Expected) == nil || !strings.Contains(ep.Expected, ":") {
+					return fmt.Errorf("invalid IPv6 address in expected: %s", ep.Expected)
+				}
+			case "CNAME":
+				// CNAME должен быть валидным доменом
+				if strings.HasSuffix(ep.Expected, ".") {
+					ep.Expected = ep.Expected[:len(ep.Expected)-1]
+				}
+			}
+		}
+
+	case "tcp":
+		if ep.Address == "" && ep.Host == "" {
+			return errors.New("address or host is required for TCP endpoint")
+		}
+
+		if ep.Address == "" {
+			if ep.Port <= 0 || ep.Port > 65535 {
+				return fmt.Errorf("invalid port: %d", ep.Port)
+			}
+			ep.Address = fmt.Sprintf("%s:%d", ep.Host, ep.Port)
+		}
+
+		// Проверяем что адрес парсится
+		if _, _, err := net.SplitHostPort(ep.Address); err != nil {
+			return fmt.Errorf("invalid TCP address: %w", err)
+		}
+
+	default:
+		return fmt.Errorf("unsupported endpoint type: %s", ep.Type)
 	}
 
 	return nil
@@ -299,29 +392,21 @@ func run() error {
 		return errors.New("no endpoints configured")
 	}
 
-	// Валидация всех эндпоинтов
+	// Нормализация типов и валидация всех эндпоинтов
 	for i, ep := range config.Endpoints {
-		if err := validateEndpoint(ep); err != nil {
+		if ep.Type == "" {
+			config.Endpoints[i].Type = "http"
+		}
+		config.Endpoints[i].Type = strings.ToLower(config.Endpoints[i].Type)
+		
+		if err := validateEndpoint(config.Endpoints[i]); err != nil {
 			return fmt.Errorf("endpoint %d validation failed: %w", i, err)
 		}
 	}
 
 	slog.Info("loaded configuration", "endpoints", len(config.Endpoints))
 	for _, ep := range config.Endpoints {
-		method := ep.Method
-		if method == "" {
-			method = http.MethodGet
-		}
-		expectedStatus := ep.ExpectedStatus
-		if expectedStatus == 0 {
-			expectedStatus = http.StatusOK
-		}
-		// Безопасное логирование без query params и credentials
-		slog.Info("monitoring endpoint",
-			"url", sanitizeURL(ep.URL),
-			"method", method,
-			"expected_status", expectedStatus,
-			"has_custom_headers", len(ep.Headers) > 0)
+		logEndpoint(ep)
 	}
 
 	monitorConfig := loadMonitorConfig()
@@ -335,6 +420,8 @@ func run() error {
 		"max_batch_size", monitorConfig.maxBatchSize,
 		"max_concurrent_checks", monitorConfig.maxConcurrentChecks,
 		"max_response_body_size", monitorConfig.maxResponseBodySize,
+		"dns_timeout", monitorConfig.dnsTimeout,
+		"tcp_timeout", monitorConfig.tcpTimeout,
 		"telegram_chat_id", maskSensitiveString(telegramChatID, 4),
 		"mattermost_enabled", mattermostURL != "")
 
@@ -351,6 +438,12 @@ func run() error {
 			ResponseHeaderTimeout: 10 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
 		},
+	}
+
+	// Создаем резолвер для DNS с оптимальными настройками
+	resolver := &net.Resolver{
+		PreferGo: true, // Используем Go реализацию для лучшего контроля
+		StrictErrors: true,
 	}
 
 	// Создаем нотификаторы
@@ -377,6 +470,7 @@ func run() error {
 		telegramChatID: telegramChatID,
 		mattermostURL:  mattermostURL,
 		httpClient:     httpClient,
+		resolver:       resolver,
 		notifyQueue:    make(chan *NotifyEvent, 100),
 		semaphore:      make(chan struct{}, monitorConfig.maxConcurrentChecks),
 		eventPool: sync.Pool{
@@ -388,7 +482,7 @@ func run() error {
 
 	// Инициализируем состояния в sync.Map
 	for _, ep := range config.Endpoints {
-		monitor.states.Store(ep.URL, &ServiceState{})
+		monitor.states.Store(ep.GetIdentifier(), &ServiceState{})
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -423,6 +517,40 @@ func run() error {
 			slog.Info("shutdown complete")
 			return nil
 		}
+	}
+}
+
+func logEndpoint(ep Endpoint) {
+	switch ep.Type {
+	case "dns":
+		slog.Info("monitoring endpoint",
+			"type", "DNS",
+			"host", ep.Host,
+			"record_type", strings.ToUpper(ep.RecordType),
+			"has_expected", ep.Expected != "")
+	case "tcp":
+		addr := ep.Address
+		if addr == "" {
+			addr = fmt.Sprintf("%s:%d", ep.Host, ep.Port)
+		}
+		slog.Info("monitoring endpoint",
+			"type", "TCP",
+			"address", addr)
+	default: // http
+		method := ep.Method
+		if method == "" {
+			method = http.MethodGet
+		}
+		expectedStatus := ep.ExpectedStatus
+		if expectedStatus == 0 {
+			expectedStatus = http.StatusOK
+		}
+		slog.Info("monitoring endpoint",
+			"type", "HTTP",
+			"url", sanitizeURL(ep.URL),
+			"method", method,
+			"expected_status", expectedStatus,
+			"has_custom_headers", len(ep.Headers) > 0)
 	}
 }
 
@@ -489,7 +617,7 @@ func (m *Monitor) checkService(ctx context.Context, ep Endpoint) {
 		return
 	}
 
-	url := ep.URL
+	identifier := ep.GetIdentifier()
 	success := m.performCheck(ctx, ep)
 
 	if !success && ctx.Err() == nil {
@@ -501,10 +629,199 @@ func (m *Monitor) checkService(ctx context.Context, ep Endpoint) {
 		success = m.performCheck(retryCtx, ep)
 	}
 
-	m.updateState(url, success)
+	m.updateState(identifier, success)
 }
 
 func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
+	switch ep.Type {
+	case "dns":
+		return m.performDNSCheck(ctx, ep)
+	case "tcp":
+		return m.performTCPCheck(ctx, ep)
+	default: // http
+		return m.performHTTPCheck(ctx, ep)
+	}
+}
+
+// performDNSCheck выполняет DNS проверку
+func (m *Monitor) performDNSCheck(ctx context.Context, ep Endpoint) bool {
+	recordType := strings.ToUpper(ep.RecordType)
+	startTime := time.Now()
+
+	// Создаем контекст с таймаутом для DNS запроса
+	dnsCtx, cancel := context.WithTimeout(ctx, m.monitorConfig.dnsTimeout)
+	defer cancel()
+
+	var success bool
+	var resultStr string
+
+	switch recordType {
+	case "A":
+		ips, err := m.resolver.LookupIPAddr(dnsCtx, ep.Host)
+		if err != nil {
+			slog.Warn("DNS A lookup failed",
+				"host", ep.Host,
+				"error", err)
+			return false
+		}
+
+		// Фильтруем только IPv4
+		var ipv4s []string
+		for _, ip := range ips {
+			if ip.IP.To4() != nil {
+				ipv4s = append(ipv4s, ip.IP.String())
+			}
+		}
+
+		if len(ipv4s) == 0 {
+			slog.Warn("DNS A lookup returned no IPv4 addresses", "host", ep.Host)
+			return false
+		}
+
+		resultStr = strings.Join(ipv4s, ", ")
+		
+		if ep.Expected != "" {
+			success = false
+			for _, ip := range ipv4s {
+				if ip == ep.Expected {
+					success = true
+					break
+				}
+			}
+			if !success {
+				slog.Warn("DNS A record mismatch",
+					"host", ep.Host,
+					"expected", ep.Expected,
+					"got", resultStr)
+				return false
+			}
+		} else {
+			success = true
+		}
+
+	case "AAAA":
+		ips, err := m.resolver.LookupIPAddr(dnsCtx, ep.Host)
+		if err != nil {
+			slog.Warn("DNS AAAA lookup failed",
+				"host", ep.Host,
+				"error", err)
+			return false
+		}
+
+		// Фильтруем только IPv6
+		var ipv6s []string
+		for _, ip := range ips {
+			if ip.IP.To4() == nil && ip.IP.To16() != nil {
+				ipv6s = append(ipv6s, ip.IP.String())
+			}
+		}
+
+		if len(ipv6s) == 0 {
+			slog.Warn("DNS AAAA lookup returned no IPv6 addresses", "host", ep.Host)
+			return false
+		}
+
+		resultStr = strings.Join(ipv6s, ", ")
+
+		if ep.Expected != "" {
+			success = false
+			for _, ip := range ipv6s {
+				if ip == ep.Expected {
+					success = true
+					break
+				}
+			}
+			if !success {
+				slog.Warn("DNS AAAA record mismatch",
+					"host", ep.Host,
+					"expected", ep.Expected,
+					"got", resultStr)
+				return false
+			}
+		} else {
+			success = true
+		}
+
+	case "CNAME":
+		cname, err := m.resolver.LookupCNAME(dnsCtx, ep.Host)
+		if err != nil {
+			slog.Warn("DNS CNAME lookup failed",
+				"host", ep.Host,
+				"error", err)
+			return false
+		}
+
+		// Удаляем завершающую точку для сравнения
+		cname = strings.TrimSuffix(cname, ".")
+		resultStr = cname
+
+		if ep.Expected != "" {
+			expected := strings.TrimSuffix(ep.Expected, ".")
+			if cname != expected {
+				slog.Warn("DNS CNAME record mismatch",
+					"host", ep.Host,
+					"expected", expected,
+					"got", cname)
+				return false
+			}
+		}
+		success = true
+	}
+
+	if success {
+		duration := time.Since(startTime)
+		slog.Debug("DNS check successful",
+			"host", ep.Host,
+			"type", recordType,
+			"result", resultStr,
+			"duration", duration.Round(time.Millisecond))
+	}
+
+	return success
+}
+
+// performTCPCheck выполняет TCP проверку
+func (m *Monitor) performTCPCheck(ctx context.Context, ep Endpoint) bool {
+	address := ep.Address
+	if address == "" {
+		address = fmt.Sprintf("%s:%d", ep.Host, ep.Port)
+	}
+
+	startTime := time.Now()
+
+	// Создаем dialer с таймаутом
+	d := net.Dialer{
+		Timeout: m.monitorConfig.tcpTimeout,
+	}
+
+	conn, err := d.DialContext(ctx, "tcp", address)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false
+		}
+		slog.Warn("TCP connection failed",
+			"address", address,
+			"error", err)
+		return false
+	}
+	
+	// Закрываем соединение сразу после успешного подключения
+	if err := conn.Close(); err != nil {
+		slog.Warn("failed to close TCP connection",
+			"address", address,
+			"error", err)
+	}
+
+	duration := time.Since(startTime)
+	slog.Debug("TCP check successful",
+		"address", address,
+		"duration", duration.Round(time.Millisecond))
+
+	return true
+}
+
+// performHTTPCheck выполняет HTTP проверку (оригинальный performCheck)
+func (m *Monitor) performHTTPCheck(ctx context.Context, ep Endpoint) bool {
 	method := ep.Method
 	if method == "" {
 		method = http.MethodGet
@@ -574,7 +891,7 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 
 	duration := time.Since(startTime)
 	// Используем Debug вместо Info для успешных проверок - меньше шума в логах
-	slog.Debug("check successful",
+	slog.Debug("HTTP check successful",
 		"url", sanitizeURL(ep.URL),
 		"status", resp.StatusCode,
 		"response_size", written,
@@ -582,11 +899,11 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 	return true
 }
 
-func (m *Monitor) updateState(url string, success bool) {
-	val, ok := m.states.Load(url)
+func (m *Monitor) updateState(identifier string, success bool) {
+	val, ok := m.states.Load(identifier)
 	if !ok {
 		// Это не должно происходить, но добавляем защиту
-		slog.Error("state not found for URL", "url", sanitizeURL(url))
+		slog.Error("state not found for identifier", "id", identifier)
 		return
 	}
 	state := val.(*ServiceState)
@@ -601,7 +918,7 @@ func (m *Monitor) updateState(url string, success bool) {
 		if state.isDown {
 			// Получаем событие из пула
 			event := m.eventPool.Get().(*NotifyEvent)
-			event.endpoint = url
+			event.endpoint = identifier
 			event.isDown = false
 			event.timestamp = now
 			event.failTime = state.firstFailTime
@@ -610,7 +927,7 @@ func (m *Monitor) updateState(url string, success bool) {
 			case m.notifyQueue <- event:
 			default:
 				slog.Warn("notification queue full, dropping recovery event",
-					"url", sanitizeURL(url))
+					"id", identifier)
 				m.eventPool.Put(event)
 			}
 
@@ -631,7 +948,7 @@ func (m *Monitor) updateState(url string, success bool) {
 
 			// Получаем событие из пула
 			event := m.eventPool.Get().(*NotifyEvent)
-			event.endpoint = url
+			event.endpoint = identifier
 			event.isDown = true
 			event.timestamp = now
 			event.failTime = state.firstFailTime
@@ -640,7 +957,7 @@ func (m *Monitor) updateState(url string, success bool) {
 			case m.notifyQueue <- event:
 			default:
 				slog.Warn("notification queue full, dropping failure event",
-					"url", sanitizeURL(url))
+					"id", identifier)
 				m.eventPool.Put(event)
 			}
 		}
