@@ -1,15 +1,10 @@
 endpoints:
-  # ============================================
-  # WORKING EXAMPLES (5)
-  # ============================================
-  
-  # 1. HTTP - Google homepage
+  # WORKING EXAMPLES
   - url: https://www.google.com
     type: http
     method: GET
     expected_status: 200
   
-  # 2. HTTP - GitHub API
   - url: https://api.github.com
     type: http
     method: GET
@@ -17,50 +12,39 @@ endpoints:
     headers:
       Accept: application/vnd.github.v3+json
   
-  # 3. DNS - Google A record
   - type: dns
     host: google.com
     record_type: A
   
-  # 4. DNS - Cloudflare DNS (1.1.1.1)
   - type: dns
     host: one.one.one.one
     record_type: A
     expected: 1.1.1.1
   
-  # 5. TCP - Google DNS
   - type: tcp
     host: 8.8.8.8
     port: 53
   
-  # ============================================
-  # FAILING EXAMPLES (5)
-  # ============================================
-  
-  # 6. HTTP - Non-existent domain
+  # FAILING EXAMPLES
   - url: https://this-domain-definitely-does-not-exist-12345.com
     type: http
     method: GET
     expected_status: 200
   
-  # 7. HTTP - Wrong status code expected
   - url: https://httpstat.us/404
     type: http
     method: GET
     expected_status: 200
   
-  # 8. DNS - Non-existent host
   - type: dns
     host: nonexistent-host-that-will-fail-12345.com
     record_type: A
   
-  # 9. DNS - Wrong expected IP
   - type: dns
     host: google.com
     record_type: A
     expected: 192.0.2.1
   
-  # 10. TCP - Closed port
   - type: tcp
     host: google.com
     port: 9999
