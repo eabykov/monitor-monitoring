@@ -992,14 +992,14 @@ func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) 
 		if len(batch) == 0 {
 			return
 		}
-		
+
 		eventsCopy := make([]NotifyEvent, len(batch))
 		for i, event := range batch {
 			eventsCopy[i] = *event
 		}
-		
+
 		m.sendBatchNotification(ctx, eventsCopy, notifiers)
-		
+
 		batch = batch[:0]
 	}
 
