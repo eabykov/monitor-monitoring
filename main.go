@@ -22,7 +22,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// MonitorConfig содержит конфигурацию мониторинга
 type MonitorConfig struct {
 	checkInterval       time.Duration
 	requestTimeout      time.Duration
@@ -45,7 +44,7 @@ func loadMonitorConfig() MonitorConfig {
 		notifyBatchWindow:   getEnvDuration("NOTIFY_BATCH_WINDOW", 10*time.Second),
 		maxBatchSize:        getEnvInt("MAX_BATCH_SIZE", 50),
 		maxConcurrentChecks: getEnvInt("MAX_CONCURRENT_CHECKS", 10),
-		maxResponseBodySize: int64(getEnvInt("MAX_RESPONSE_BODY_SIZE", 1048576)), // 1MB
+		maxResponseBodySize: int64(getEnvInt("MAX_RESPONSE_BODY_SIZE", 1048576)),
 		dnsTimeout:          getEnvDuration("DNS_TIMEOUT", 5*time.Second),
 		tcpTimeout:          getEnvDuration("TCP_TIMEOUT", 10*time.Second),
 	}
@@ -95,7 +94,6 @@ type Endpoint struct {
 	Address string `yaml:"address,omitempty"` // полный адрес для TCP (альтернатива host:port)
 }
 
-// GetIdentifier возвращает уникальный идентификатор для endpoint
 func (e Endpoint) GetIdentifier() string {
 	switch strings.ToLower(e.Type) {
 	case "dns":
@@ -110,7 +108,6 @@ func (e Endpoint) GetIdentifier() string {
 	}
 }
 
-// ServiceState использует RWMutex для оптимизации чтения
 type ServiceState struct {
 	mu               sync.RWMutex
 	consecutiveFails int
@@ -127,7 +124,7 @@ type Monitor struct {
 	telegramChatID string
 	mattermostURL  string
 	httpClient     *http.Client
-	resolver       *net.Resolver // для DNS проверок
+	resolver       *net.Resolver
 	notifyQueue    chan *NotifyEvent
 	semaphore      chan struct{}
 	wg             sync.WaitGroup
@@ -141,13 +138,11 @@ type NotifyEvent struct {
 	failTime  time.Time
 }
 
-// Notifier интерфейс для унификации отправки уведомлений
 type Notifier interface {
 	Send(ctx context.Context, message string) error
 	Name() string
 }
 
-// TelegramNotifier реализация для Telegram
 type TelegramNotifier struct {
 	token      string
 	chatID     string
@@ -168,7 +163,6 @@ func (t *TelegramNotifier) Name() string {
 	return "Telegram"
 }
 
-// MattermostNotifier реализация для Mattermost
 type MattermostNotifier struct {
 	webhookURL string
 	httpClient *http.Client
@@ -183,7 +177,6 @@ func (m *MattermostNotifier) Name() string {
 	return "Mattermost"
 }
 
-// sendJSONRequest унифицированная функция с ограничением размера ответа
 func sendJSONRequest(ctx context.Context, client *http.Client, targetURL string, payload interface{}) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -206,7 +199,6 @@ func sendJSONRequest(ctx context.Context, client *http.Client, targetURL string,
 		}
 	}()
 
-	// Ограничиваем чтение ответа до 1MB для защиты от OOM
 	limited := io.LimitReader(resp.Body, 1<<20)
 	if _, err := io.Copy(io.Discard, limited); err != nil {
 		return fmt.Errorf("drain body: %w", err)
@@ -218,8 +210,6 @@ func sendJSONRequest(ctx context.Context, client *http.Client, targetURL string,
 
 	return nil
 }
-
-// maskSensitiveString маскирует чувствительные данные для логов
 func maskSensitiveString(s string, showLast int) string {
 	if len(s) <= showLast {
 		return "***"
@@ -227,7 +217,6 @@ func maskSensitiveString(s string, showLast int) string {
 	return strings.Repeat("*", len(s)-showLast) + s[len(s)-showLast:]
 }
 
-// sanitizeURL удаляет query parameters и credentials из URL для безопасного логирования
 func sanitizeURL(rawURL string) string {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
@@ -238,7 +227,6 @@ func sanitizeURL(rawURL string) string {
 	return parsed.String()
 }
 
-// validateEndpoint валидирует endpoint перед использованием
 func validateEndpoint(ep Endpoint) error {
 	endpointType := strings.ToLower(ep.Type)
 	if endpointType == "" {
@@ -264,7 +252,6 @@ func validateEndpoint(ep Endpoint) error {
 			return errors.New("URL must have a host")
 		}
 
-		// Проверяем метод
 		if ep.Method != "" {
 			method := strings.ToUpper(ep.Method)
 			validMethods := map[string]bool{
@@ -276,7 +263,6 @@ func validateEndpoint(ep Endpoint) error {
 			}
 		}
 
-		// Проверяем expected status
 		if ep.ExpectedStatus != 0 && (ep.ExpectedStatus < 100 || ep.ExpectedStatus > 599) {
 			return fmt.Errorf("invalid expected status code: %d", ep.ExpectedStatus)
 		}
@@ -296,7 +282,6 @@ func validateEndpoint(ep Endpoint) error {
 			return fmt.Errorf("unsupported DNS record type: %s (supported: A, AAAA, CNAME)", recordType)
 		}
 
-		// Валидация expected если задано
 		if ep.Expected != "" {
 			switch recordType {
 			case "A":
@@ -308,10 +293,7 @@ func validateEndpoint(ep Endpoint) error {
 					return fmt.Errorf("invalid IPv6 address in expected: %s", ep.Expected)
 				}
 			case "CNAME":
-				// CNAME должен быть валидным доменом
-				if strings.HasSuffix(ep.Expected, ".") {
-					ep.Expected = ep.Expected[:len(ep.Expected)-1]
-				}
+				ep.Expected = strings.TrimSuffix(ep.Expected, ".")
 			}
 		}
 
@@ -327,7 +309,6 @@ func validateEndpoint(ep Endpoint) error {
 			ep.Address = fmt.Sprintf("%s:%d", ep.Host, ep.Port)
 		}
 
-		// Проверяем что адрес парсится
 		if _, _, err := net.SplitHostPort(ep.Address); err != nil {
 			return fmt.Errorf("invalid TCP address: %w", err)
 		}
@@ -360,12 +341,10 @@ func run() error {
 		return errors.New("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
 	}
 
-	// Валидация Telegram token (базовая проверка формата)
 	if !strings.Contains(telegramToken, ":") || len(telegramToken) < 20 {
 		return errors.New("TELEGRAM_BOT_TOKEN appears to be invalid")
 	}
 
-	// Валидация Mattermost webhook URL если задан
 	if mattermostURL != "" {
 		parsed, err := url.Parse(mattermostURL)
 		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
@@ -392,7 +371,6 @@ func run() error {
 		return errors.New("no endpoints configured")
 	}
 
-	// Нормализация типов и валидация всех эндпоинтов
 	for i, ep := range config.Endpoints {
 		if ep.Type == "" {
 			config.Endpoints[i].Type = "http"
@@ -410,7 +388,6 @@ func run() error {
 	}
 
 	monitorConfig := loadMonitorConfig()
-	// Безопасное логирование - маскируем chat_id
 	slog.Info("monitor configuration",
 		"check_interval", monitorConfig.checkInterval,
 		"request_timeout", monitorConfig.requestTimeout,
@@ -425,7 +402,6 @@ func run() error {
 		"telegram_chat_id", maskSensitiveString(telegramChatID, 4),
 		"mattermost_enabled", mattermostURL != "")
 
-	// HTTP клиент с оптимизированными параметрами
 	httpClient := &http.Client{
 		Timeout: monitorConfig.requestTimeout,
 		Transport: &http.Transport{
@@ -440,13 +416,11 @@ func run() error {
 		},
 	}
 
-	// Создаем резолвер для DNS с оптимальными настройками
 	resolver := &net.Resolver{
-		PreferGo: true, // Используем Go реализацию для лучшего контроля
+		PreferGo: true,
 		StrictErrors: true,
 	}
 
-	// Создаем нотификаторы
 	notifiers := []Notifier{
 		&TelegramNotifier{
 			token:      telegramToken,
@@ -479,8 +453,6 @@ func run() error {
 			},
 		},
 	}
-
-	// Инициализируем состояния в sync.Map
 	for _, ep := range config.Endpoints {
 		monitor.states.Store(ep.GetIdentifier(), &ServiceState{})
 	}
@@ -491,7 +463,6 @@ func run() error {
 	monitor.wg.Add(1)
 	go monitor.notificationWorker(ctx, notifiers)
 
-	// Горутина для периодического логирования метрик памяти
 	monitor.wg.Add(1)
 	go monitor.memoryMonitor(ctx)
 
@@ -554,7 +525,6 @@ func logEndpoint(ep Endpoint) {
 	}
 }
 
-// memoryMonitor периодически логирует использование памяти
 func (m *Monitor) memoryMonitor(ctx context.Context) {
 	defer m.wg.Done()
 
@@ -573,7 +543,6 @@ func (m *Monitor) memoryMonitor(ctx context.Context) {
 				"num_gc", memStats.NumGC,
 				"goroutines", runtime.NumGoroutine())
 
-			// Только предупреждаем при очень высоком использовании (500MB+)
 			if memStats.Alloc > 500*1024*1024 {
 				slog.Warn("high memory usage detected", "alloc_mb", memStats.Alloc/1024/1024)
 			}
@@ -596,7 +565,6 @@ func (m *Monitor) checkAllServices(ctx context.Context) {
 		go func(endpoint Endpoint) {
 			defer wg.Done()
 
-			// Используем семафор для строгого контроля конкурентности
 			select {
 			case m.semaphore <- struct{}{}:
 				defer func() { <-m.semaphore }()
@@ -621,7 +589,6 @@ func (m *Monitor) checkService(ctx context.Context, ep Endpoint) {
 	success := m.performCheck(ctx, ep)
 
 	if !success && ctx.Err() == nil {
-		// Используем контекст с таймаутом для retry
 		retryCtx, cancel := context.WithTimeout(ctx, m.monitorConfig.retryDelay+m.monitorConfig.requestTimeout)
 		defer cancel()
 
@@ -638,17 +605,15 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 		return m.performDNSCheck(ctx, ep)
 	case "tcp":
 		return m.performTCPCheck(ctx, ep)
-	default: // http
+	default:
 		return m.performHTTPCheck(ctx, ep)
 	}
 }
 
-// performDNSCheck выполняет DNS проверку
 func (m *Monitor) performDNSCheck(ctx context.Context, ep Endpoint) bool {
 	recordType := strings.ToUpper(ep.RecordType)
 	startTime := time.Now()
 
-	// Создаем контекст с таймаутом для DNS запроса
 	dnsCtx, cancel := context.WithTimeout(ctx, m.monitorConfig.dnsTimeout)
 	defer cancel()
 
@@ -665,7 +630,6 @@ func (m *Monitor) performDNSCheck(ctx context.Context, ep Endpoint) bool {
 			return false
 		}
 
-		// Фильтруем только IPv4
 		var ipv4s []string
 		for _, ip := range ips {
 			if ip.IP.To4() != nil {
@@ -708,7 +672,6 @@ func (m *Monitor) performDNSCheck(ctx context.Context, ep Endpoint) bool {
 			return false
 		}
 
-		// Фильтруем только IPv6
 		var ipv6s []string
 		for _, ip := range ips {
 			if ip.IP.To4() == nil && ip.IP.To16() != nil {
@@ -751,7 +714,6 @@ func (m *Monitor) performDNSCheck(ctx context.Context, ep Endpoint) bool {
 			return false
 		}
 
-		// Удаляем завершающую точку для сравнения
 		cname = strings.TrimSuffix(cname, ".")
 		resultStr = cname
 
@@ -780,7 +742,6 @@ func (m *Monitor) performDNSCheck(ctx context.Context, ep Endpoint) bool {
 	return success
 }
 
-// performTCPCheck выполняет TCP проверку
 func (m *Monitor) performTCPCheck(ctx context.Context, ep Endpoint) bool {
 	address := ep.Address
 	if address == "" {
@@ -789,7 +750,6 @@ func (m *Monitor) performTCPCheck(ctx context.Context, ep Endpoint) bool {
 
 	startTime := time.Now()
 
-	// Создаем dialer с таймаутом
 	d := net.Dialer{
 		Timeout: m.monitorConfig.tcpTimeout,
 	}
@@ -805,7 +765,6 @@ func (m *Monitor) performTCPCheck(ctx context.Context, ep Endpoint) bool {
 		return false
 	}
 	
-	// Закрываем соединение сразу после успешного подключения
 	if err := conn.Close(); err != nil {
 		slog.Warn("failed to close TCP connection",
 			"address", address,
@@ -820,7 +779,6 @@ func (m *Monitor) performTCPCheck(ctx context.Context, ep Endpoint) bool {
 	return true
 }
 
-// performHTTPCheck выполняет HTTP проверку (оригинальный performCheck)
 func (m *Monitor) performHTTPCheck(ctx context.Context, ep Endpoint) bool {
 	method := ep.Method
 	if method == "" {
@@ -841,7 +799,6 @@ func (m *Monitor) performHTTPCheck(ctx context.Context, ep Endpoint) bool {
 		return false
 	}
 
-	// Пользовательские заголовки имеют приоритет
 	for k, v := range ep.Headers {
 		req.Header.Set(k, v)
 	}
@@ -864,7 +821,6 @@ func (m *Monitor) performHTTPCheck(ctx context.Context, ep Endpoint) bool {
 		}
 	}()
 
-	// КРИТИЧНО: Ограничиваем чтение тела ответа для защиты от OOM
 	limited := io.LimitReader(resp.Body, m.monitorConfig.maxResponseBodySize)
 	written, err := io.Copy(io.Discard, limited)
 	if err != nil {
@@ -873,7 +829,6 @@ func (m *Monitor) performHTTPCheck(ctx context.Context, ep Endpoint) bool {
 			"error", err)
 	}
 
-	// Предупреждаем, если тело ответа слишком большое
 	if written >= m.monitorConfig.maxResponseBodySize {
 		slog.Warn("response body truncated",
 			"url", sanitizeURL(ep.URL),
@@ -890,7 +845,6 @@ func (m *Monitor) performHTTPCheck(ctx context.Context, ep Endpoint) bool {
 	}
 
 	duration := time.Since(startTime)
-	// Используем Debug вместо Info для успешных проверок - меньше шума в логах
 	slog.Debug("HTTP check successful",
 		"url", sanitizeURL(ep.URL),
 		"status", resp.StatusCode,
@@ -902,7 +856,6 @@ func (m *Monitor) performHTTPCheck(ctx context.Context, ep Endpoint) bool {
 func (m *Monitor) updateState(identifier string, success bool) {
 	val, ok := m.states.Load(identifier)
 	if !ok {
-		// Это не должно происходить, но добавляем защиту
 		slog.Error("state not found for identifier", "id", identifier)
 		return
 	}
@@ -916,7 +869,6 @@ func (m *Monitor) updateState(identifier string, success bool) {
 
 	if success {
 		if state.isDown {
-			// Получаем событие из пула
 			event := m.eventPool.Get().(*NotifyEvent)
 			event.endpoint = identifier
 			event.isDown = false
@@ -946,7 +898,6 @@ func (m *Monitor) updateState(identifier string, success bool) {
 		if state.consecutiveFails >= m.monitorConfig.failureThreshold && !state.isDown {
 			state.isDown = true
 
-			// Получаем событие из пула
 			event := m.eventPool.Get().(*NotifyEvent)
 			event.endpoint = identifier
 			event.isDown = true
@@ -964,7 +915,6 @@ func (m *Monitor) updateState(identifier string, success bool) {
 	}
 }
 
-// notificationWorker оптимизированная версия с упрощенным управлением таймером
 func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) {
 	defer m.wg.Done()
 
@@ -975,7 +925,6 @@ func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) 
 	flush := func() {
 		if len(batch) > 0 {
 			m.sendBatchNotification(ctx, batch, notifiers)
-			// Возвращаем события в пул
 			for _, event := range batch {
 				m.eventPool.Put(event)
 			}
@@ -994,12 +943,10 @@ func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) 
 
 			batch = append(batch, event)
 
-			// Если достигли максимального размера батча, отправляем сразу
 			if len(batch) >= m.monitorConfig.maxBatchSize {
 				timer.Stop()
 				flush()
 			} else if len(batch) == 1 {
-				// Запускаем таймер только для первого события
 				timer.Reset(m.monitorConfig.notifyBatchWindow)
 			}
 
@@ -1034,7 +981,6 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []*NotifyEve
 		}
 	}
 
-	// Точный расчет размера буфера
 	estimatedSize := 0
 	if len(downServices) > 0 {
 		estimatedSize += 25
@@ -1081,11 +1027,9 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []*NotifyEve
 
 	msg := sb.String()
 
-	// Контекст с таймаутом для уведомлений
 	notifyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	// Пробуем отправить через все доступные нотификаторы
 	for _, notifier := range notifiers {
 		if err := notifier.Send(notifyCtx, msg); err != nil {
 			slog.Warn("notification failed",
