@@ -124,7 +124,6 @@ type Monitor struct {
 	notifyQueue    chan *NotifyEvent
 	semaphore      chan struct{}
 	wg             sync.WaitGroup
-	eventPool      sync.Pool
 	shutdown       chan struct{}
 }
 
@@ -468,11 +467,6 @@ func run() error {
 		notifyQueue:    make(chan *NotifyEvent, 100),
 		semaphore:      make(chan struct{}, monitorConfig.maxConcurrentChecks),
 		shutdown:       make(chan struct{}),
-		eventPool: sync.Pool{
-			New: func() interface{} {
-				return &NotifyEvent{}
-			},
-		},
 	}
 
 	for _, ep := range config.Endpoints {
@@ -674,6 +668,85 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 	}
 }
 
+type dnsLookupResult struct {
+	records   []string
+	recordStr string
+	err       error
+}
+
+func (m *Monitor) lookupIPv4(ctx context.Context, host string) dnsLookupResult {
+	ips, err := m.resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return dnsLookupResult{err: err}
+	}
+
+	var ipv4s []string
+	for _, ip := range ips {
+		if ip.IP.To4() != nil {
+			ipv4s = append(ipv4s, ip.IP.String())
+		}
+	}
+
+	if len(ipv4s) == 0 {
+		return dnsLookupResult{err: errors.New("no IPv4 addresses found")}
+	}
+
+	return dnsLookupResult{
+		records:   ipv4s,
+		recordStr: strings.Join(ipv4s, ", "),
+	}
+}
+
+func (m *Monitor) lookupIPv6(ctx context.Context, host string) dnsLookupResult {
+	ips, err := m.resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return dnsLookupResult{err: err}
+	}
+
+	var ipv6s []string
+	for _, ip := range ips {
+		if ip.IP.To4() == nil && ip.IP.To16() != nil {
+			ipv6s = append(ipv6s, ip.IP.String())
+		}
+	}
+
+	if len(ipv6s) == 0 {
+		return dnsLookupResult{err: errors.New("no IPv6 addresses found")}
+	}
+
+	return dnsLookupResult{
+		records:   ipv6s,
+		recordStr: strings.Join(ipv6s, ", "),
+	}
+}
+
+func (m *Monitor) lookupCNAME(ctx context.Context, host string) dnsLookupResult {
+	cname, err := m.resolver.LookupCNAME(ctx, host)
+	if err != nil {
+		return dnsLookupResult{err: err}
+	}
+
+	cname = strings.TrimSuffix(cname, ".")
+	return dnsLookupResult{
+		records:   []string{cname},
+		recordStr: cname,
+	}
+}
+
+func validateDNSResult(result dnsLookupResult, expected string) bool {
+	if expected == "" {
+		return true
+	}
+
+	expected = strings.TrimSuffix(expected, ".")
+	for _, record := range result.records {
+		if record == expected {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Monitor) performDNSCheck(ctx context.Context, ep Endpoint) bool {
 	recordType := strings.ToUpper(ep.RecordType)
 	startTime := time.Now()
@@ -681,129 +754,45 @@ func (m *Monitor) performDNSCheck(ctx context.Context, ep Endpoint) bool {
 	dnsCtx, cancel := context.WithTimeout(ctx, m.monitorConfig.dnsTimeout)
 	defer cancel()
 
-	var success bool
-	var resultStr string
+	var result dnsLookupResult
 
 	switch recordType {
 	case "A":
-		ips, err := m.resolver.LookupIPAddr(dnsCtx, ep.Host)
-		if err != nil {
-			slog.Warn("DNS A lookup failed",
-				"host", ep.Host,
-				"error", err)
-			return false
-		}
-
-		var ipv4s []string
-		for _, ip := range ips {
-			if ip.IP.To4() != nil {
-				ipv4s = append(ipv4s, ip.IP.String())
-			}
-		}
-
-		if len(ipv4s) == 0 {
-			slog.Warn("DNS A lookup returned no IPv4 addresses", "host", ep.Host)
-			return false
-		}
-
-		resultStr = strings.Join(ipv4s, ", ")
-
-		if ep.Expected != "" {
-			success = false
-			for _, ip := range ipv4s {
-				if ip == ep.Expected {
-					success = true
-					break
-				}
-			}
-			if !success {
-				slog.Warn("DNS A record mismatch",
-					"host", ep.Host,
-					"expected", ep.Expected,
-					"got", resultStr)
-				return false
-			}
-		} else {
-			success = true
-		}
-
+		result = m.lookupIPv4(dnsCtx, ep.Host)
 	case "AAAA":
-		ips, err := m.resolver.LookupIPAddr(dnsCtx, ep.Host)
-		if err != nil {
-			slog.Warn("DNS AAAA lookup failed",
-				"host", ep.Host,
-				"error", err)
-			return false
-		}
-
-		var ipv6s []string
-		for _, ip := range ips {
-			if ip.IP.To4() == nil && ip.IP.To16() != nil {
-				ipv6s = append(ipv6s, ip.IP.String())
-			}
-		}
-
-		if len(ipv6s) == 0 {
-			slog.Warn("DNS AAAA lookup returned no IPv6 addresses", "host", ep.Host)
-			return false
-		}
-
-		resultStr = strings.Join(ipv6s, ", ")
-
-		if ep.Expected != "" {
-			success = false
-			for _, ip := range ipv6s {
-				if ip == ep.Expected {
-					success = true
-					break
-				}
-			}
-			if !success {
-				slog.Warn("DNS AAAA record mismatch",
-					"host", ep.Host,
-					"expected", ep.Expected,
-					"got", resultStr)
-				return false
-			}
-		} else {
-			success = true
-		}
-
+		result = m.lookupIPv6(dnsCtx, ep.Host)
 	case "CNAME":
-		cname, err := m.resolver.LookupCNAME(dnsCtx, ep.Host)
-		if err != nil {
-			slog.Warn("DNS CNAME lookup failed",
-				"host", ep.Host,
-				"error", err)
-			return false
-		}
-
-		cname = strings.TrimSuffix(cname, ".")
-		resultStr = cname
-
-		if ep.Expected != "" {
-			expected := strings.TrimSuffix(ep.Expected, ".")
-			if cname != expected {
-				slog.Warn("DNS CNAME record mismatch",
-					"host", ep.Host,
-					"expected", expected,
-					"got", cname)
-				return false
-			}
-		}
-		success = true
+		result = m.lookupCNAME(dnsCtx, ep.Host)
+	default:
+		slog.Error("unsupported DNS record type", "type", recordType)
+		return false
 	}
 
-	if success {
-		duration := time.Since(startTime)
-		slog.Debug("DNS check successful",
+	if result.err != nil {
+		slog.Warn("DNS lookup failed",
 			"host", ep.Host,
 			"type", recordType,
-			"result", resultStr,
-			"duration", duration.Round(time.Millisecond))
+			"error", result.err)
+		return false
 	}
 
-	return success
+	if !validateDNSResult(result, ep.Expected) {
+		slog.Warn("DNS record mismatch",
+			"host", ep.Host,
+			"type", recordType,
+			"expected", ep.Expected,
+			"got", result.recordStr)
+		return false
+	}
+
+	duration := time.Since(startTime)
+	slog.Debug("DNS check successful",
+		"host", ep.Host,
+		"type", recordType,
+		"result", result.recordStr,
+		"duration", duration.Round(time.Millisecond))
+
+	return true
 }
 
 func (m *Monitor) performTCPCheck(ctx context.Context, ep Endpoint) bool {
@@ -935,20 +924,19 @@ func (m *Monitor) updateState(identifier string, success bool) {
 	if success {
 		wasDown := state.isDown
 		if wasDown {
-			event := m.eventPool.Get().(*NotifyEvent)
-			event.endpoint = identifier
-			event.isDown = false
-			event.timestamp = now
-			event.failTime = state.firstFailTime
+			event := &NotifyEvent{
+				endpoint:  identifier,
+				isDown:    false,
+				timestamp: now,
+				failTime:  state.firstFailTime,
+			}
 
 			select {
 			case m.notifyQueue <- event:
 			case <-m.shutdown:
-				m.eventPool.Put(event)
 			default:
 				slog.Warn("notification queue full, dropping recovery event",
 					"id", identifier)
-				m.eventPool.Put(event)
 			}
 
 			state.isDown = false
@@ -966,20 +954,19 @@ func (m *Monitor) updateState(identifier string, success bool) {
 		if state.consecutiveFails >= m.monitorConfig.failureThreshold && !state.isDown {
 			state.isDown = true
 
-			event := m.eventPool.Get().(*NotifyEvent)
-			event.endpoint = identifier
-			event.isDown = true
-			event.timestamp = now
-			event.failTime = state.firstFailTime
+			event := &NotifyEvent{
+				endpoint:  identifier,
+				isDown:    true,
+				timestamp: now,
+				failTime:  state.firstFailTime,
+			}
 
 			select {
 			case m.notifyQueue <- event:
 			case <-m.shutdown:
-				m.eventPool.Put(event)
 			default:
 				slog.Warn("notification queue full, dropping failure event",
 					"id", identifier)
-				m.eventPool.Put(event)
 			}
 		}
 	}
@@ -990,33 +977,36 @@ func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) 
 
 	batch := make([]*NotifyEvent, 0, m.monitorConfig.maxBatchSize)
 	timer := time.NewTimer(m.monitorConfig.notifyBatchWindow)
-	if !timer.Stop() {
-		select {
-		case <-timer.C:
-		default:
+	timer.Stop()
+
+	defer func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
 		}
-	}
+	}()
 
 	flush := func() {
-		if len(batch) > 0 {
-			m.sendBatchNotification(ctx, batch, notifiers)
-			for _, event := range batch {
-				m.eventPool.Put(event)
-			}
-			batch = batch[:0]
+		if len(batch) == 0 {
+			return
 		}
+		
+		eventsCopy := make([]NotifyEvent, len(batch))
+		for i, event := range batch {
+			eventsCopy[i] = *event
+		}
+		
+		m.sendBatchNotification(ctx, eventsCopy, notifiers)
+		
+		batch = batch[:0]
 	}
 
 	for {
 		select {
 		case event, ok := <-m.notifyQueue:
 			if !ok {
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
 				flush()
 				return
 			}
@@ -1039,19 +1029,13 @@ func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) 
 			flush()
 
 		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
 			flush()
 			return
 		}
 	}
 }
 
-func (m *Monitor) sendBatchNotification(ctx context.Context, events []*NotifyEvent, notifiers []Notifier) {
+func (m *Monitor) sendBatchNotification(ctx context.Context, events []NotifyEvent, notifiers []Notifier) {
 	if len(events) == 0 {
 		return
 	}
@@ -1061,7 +1045,8 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []*NotifyEve
 	downDetails := make(map[string]time.Time, len(events))
 	upDetails := make(map[string]time.Time, len(events))
 
-	for _, e := range events {
+	for i := range events {
+		e := &events[i]
 		if e.isDown {
 			downServices = append(downServices, e.endpoint)
 			downDetails[e.endpoint] = e.failTime
