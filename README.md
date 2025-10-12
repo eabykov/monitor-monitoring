@@ -45,11 +45,6 @@ cd monitor-monitoring
 go build -o monitor-monitoring .
 ```
 
-**Or install directly:**
-```bash
-go install github.com/eabykov/monitor-monitoring@latest
-```
-
 ### 3. Configure Your Endpoints
 
 Create `config.yaml`:
