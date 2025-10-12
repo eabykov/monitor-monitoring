@@ -54,8 +54,6 @@ export TELEGRAM_CHAT_ID="-1001234567890"
 ./monitor-monitoring
 ```
 
-
-
 ## ⚙️ Configuration
 
 ### Environment variables
@@ -78,54 +76,7 @@ endpoints:
     method: GET              # optional, defaults to GET
     expected_status: 200     # optional, defaults to 200
     headers:                 # optional
-      Authorization: Bearer secret
-```
-
-## 📦 Deployment
-
-### Docker
-
-Build & run:
-
-```bash
-docker build -t monitor-monitoring .
-docker run -d \
-  -e TELEGRAM_BOT_TOKEN \
-  -e TELEGRAM_CHAT_ID \
-  -e MATTERMOST_WEBHOOK_URL \
-  -v $(pwd)/config.yaml:/etc/monitor/config.yaml \
-  --name monitor-monitoring \
-  monitor-monitoring
-```
-
-### systemd (Linux)
-
-```ini
-# /etc/systemd/system/monitor-monitoring.service
-[Unit]
-Description=HTTP Service Monitor
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=monitor
-Group=monitor
-WorkingDirectory=/opt/monitor
-ExecStart=/opt/monitor/monitor-monitoring
-Environment="TELEGRAM_BOT_TOKEN=___"
-Environment="TELEGRAM_CHAT_ID=___"
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-```
-
-## 🧪 Testing
-
-```bash
-go test ./...
+      Authorization: Bearer
 ```
 
 ## 🔍 Troubleshooting
