@@ -41,7 +41,7 @@ func loadMonitorConfig() MonitorConfig {
 		requestTimeout:      getEnvDuration("REQUEST_TIMEOUT", 10*time.Second),
 		retryDelay:          getEnvDuration("RETRY_DELAY", 3*time.Second),
 		failureThreshold:    getEnvInt("FAILURE_THRESHOLD", 2),
-		notifyBatchWindow:   getEnvDuration("NOTIFY_BATCH_WINDOW", 25*time.Second),
+		notifyBatchWindow:   getEnvDuration("NOTIFY_BATCH_WINDOW", 40*time.Second),
 		maxBatchSize:        getEnvInt("MAX_BATCH_SIZE", 50),
 		maxConcurrentChecks: getEnvInt("MAX_CONCURRENT_CHECKS", 20),
 		maxResponseBodySize: int64(getEnvInt("MAX_RESPONSE_BODY_SIZE", 524288)),
