@@ -89,7 +89,7 @@ export TELEGRAM_CHAT_ID="-1001234567890"
 | `REQUEST_TIMEOUT` | `10s` | No | HTTP request timeout per check |
 | `RETRY_DELAY` | `3s` | No | Wait time before retrying failed checks |
 | `FAILURE_THRESHOLD` | `2` | No | Consecutive failures before marking service DOWN |
-| `NOTIFY_BATCH_WINDOW` | `25s` | No | Maximum time to wait before sending notification batch |
+| `NOTIFY_BATCH_WINDOW` | `40s` | No | Maximum time to wait before sending notification batch |
 | `MAX_BATCH_SIZE` | `50` | No | Maximum number of notifications in one batch |
 | `MAX_CONCURRENT_CHECKS` | `20` | No | Maximum parallel health checks |
 | `MAX_RESPONSE_BODY_SIZE` | `524288` | No | Maximum HTTP response body size in bytes (0.5MB) |
