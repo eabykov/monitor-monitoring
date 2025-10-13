@@ -41,7 +41,7 @@ func loadMonitorConfig() MonitorConfig {
 		requestTimeout:      getEnvDuration("REQUEST_TIMEOUT", 45*time.Second),
 		retryDelay:          getEnvDuration("RETRY_DELAY", 5*time.Second),
 		failureThreshold:    getEnvInt("FAILURE_THRESHOLD", 3),
-		notifyBatchWindow:   getEnvDuration("NOTIFY_BATCH_WINDOW", 10*time.Second),
+		notifyBatchWindow:   getEnvDuration("NOTIFY_BATCH_WINDOW", 15*time.Second),
 		maxBatchSize:        getEnvInt("MAX_BATCH_SIZE", 100),
 		maxConcurrentChecks: getEnvInt("MAX_CONCURRENT_CHECKS", 20),
 		maxResponseBodySize: int64(getEnvInt("MAX_RESPONSE_BODY_SIZE", 1048576)),
@@ -71,6 +71,25 @@ func getEnvInt(key string, defaultVal int) int {
 			"key", key, "default", defaultVal)
 	}
 	return defaultVal
+}
+
+func getHostname() string {
+	if hostname := os.Getenv("MONITOR_HOSTNAME"); hostname != "" {
+		return strings.TrimSpace(hostname)
+	}
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		slog.Warn("failed to get system hostname, using fallback", "error", err)
+		return "unknown-host"
+	}
+
+	hostname = strings.TrimSpace(hostname)
+	if hostname == "" {
+		return "unknown-host"
+	}
+
+	return hostname
 }
 
 type Config struct {
@@ -125,6 +144,7 @@ type Monitor struct {
 	semaphore      chan struct{}
 	wg             sync.WaitGroup
 	shutdown       chan struct{}
+	hostname       string
 }
 
 type NotifyEvent struct {
@@ -353,6 +373,8 @@ func run() error {
 		}
 	}
 
+	hostname := getHostname()
+
 	configPath := "config.yaml"
 	if cp := os.Getenv("CONFIG_PATH"); cp != "" {
 		configPath = cp
@@ -396,6 +418,7 @@ func run() error {
 	}
 
 	slog.Info("monitor configuration",
+		"hostname", hostname,
 		"check_interval", monitorConfig.checkInterval,
 		"request_timeout", monitorConfig.requestTimeout,
 		"retry_delay", monitorConfig.retryDelay,
@@ -467,6 +490,7 @@ func run() error {
 		notifyQueue:    make(chan *NotifyEvent, 100),
 		semaphore:      make(chan struct{}, monitorConfig.maxConcurrentChecks),
 		shutdown:       make(chan struct{}),
+		hostname:       hostname,
 	}
 
 	for _, ep := range config.Endpoints {
@@ -1056,7 +1080,7 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []NotifyEven
 		}
 	}
 
-	estimatedSize := 100
+	estimatedSize := 150 + len(m.hostname)
 	if len(downServices) > 0 {
 		for _, svc := range downServices {
 			estimatedSize += len(svc) + 60
@@ -1071,6 +1095,10 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []NotifyEven
 	var sb strings.Builder
 	sb.Grow(estimatedSize)
 
+	sb.WriteString("🖥 *Host:* `")
+	sb.WriteString(m.hostname)
+	sb.WriteString("`\n\n")
+
 	if len(downServices) > 0 {
 		sb.WriteString("🔴 *Services DOWN:*\n")
 		for _, svc := range downServices {
@@ -1083,7 +1111,7 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []NotifyEven
 	}
 
 	if len(upServices) > 0 {
-		if sb.Len() > 0 {
+		if sb.Len() > len(m.hostname)+20 {
 			sb.WriteString("\n")
 		}
 		sb.WriteString("✅ *Services RECOVERED:*\n")
