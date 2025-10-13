@@ -74,7 +74,7 @@ export TELEGRAM_CHAT_ID="-1001234567890"
 ```
 2024/01/15 14:30:25 INFO loaded configuration endpoints=1
 2024/01/15 14:30:25 INFO monitoring endpoint type=HTTP url=https://api.github.com method=GET expected_status=200 has_custom_headers=false
-2024/01/15 14:30:25 INFO starting service monitor interval=1m0s gomaxprocs=8
+2024/01/15 14:30:25 INFO starting service monitor hostname=web01 interval=1m0s gomaxprocs=8
 ```
 
 ## ⚙️ Configuration
@@ -89,7 +89,7 @@ export TELEGRAM_CHAT_ID="-1001234567890"
 | `REQUEST_TIMEOUT` | `45s` | No | HTTP request timeout per check |
 | `RETRY_DELAY` | `5s` | No | Wait time before retrying failed checks |
 | `FAILURE_THRESHOLD` | `3` | No | Consecutive failures before marking service DOWN |
-| `NOTIFY_BATCH_WINDOW` | `10s` | No | Maximum time to wait before sending notification batch |
+| `NOTIFY_BATCH_WINDOW` | `15s` | No | Maximum time to wait before sending notification batch |
 | `MAX_BATCH_SIZE` | `100` | No | Maximum number of notifications in one batch |
 | `MAX_CONCURRENT_CHECKS` | `20` | No | Maximum parallel health checks |
 | `MAX_RESPONSE_BODY_SIZE` | `1048576` | No | Maximum HTTP response body size in bytes (1MB) |
@@ -97,6 +97,7 @@ export TELEGRAM_CHAT_ID="-1001234567890"
 | `TCP_TIMEOUT` | `10s` | No | Timeout for TCP connection attempts |
 | `CONFIG_PATH` | `config.yaml` | No | Path to YAML configuration file |
 | `MATTERMOST_WEBHOOK_URL` | - | No | Mattermost webhook URL for fallback notifications |
+| `MONITOR_HOSTNAME` | (auto) | No | Rewrite the default hostname that will be displayed in notifications |
 
 ### YAML Schema (`config.yaml`)
 
