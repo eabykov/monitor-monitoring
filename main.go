@@ -1095,14 +1095,14 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []NotifyEven
 	var sb strings.Builder
 	sb.Grow(estimatedSize)
 
-	sb.WriteString("🖥 *Host:* `")
+	sb.WriteString("*Host:* `")
 	sb.WriteString(m.hostname)
 	sb.WriteString("`\n\n")
 
 	if len(downServices) > 0 {
-		sb.WriteString("🔴 *Services DOWN:*\n")
+		sb.WriteString("*Services DOWN:*\n")
 		for _, svc := range downServices {
-			sb.WriteString("• ")
+			sb.WriteString("- ")
 			sb.WriteString(svc)
 			sb.WriteString("\n  Failed at: ")
 			sb.WriteString(downDetails[svc].Format("2006-01-02 15:04:05"))
@@ -1114,11 +1114,11 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []NotifyEven
 		if sb.Len() > len(m.hostname)+20 {
 			sb.WriteString("\n")
 		}
-		sb.WriteString("✅ *Services RECOVERED:*\n")
+		sb.WriteString("*Services RECOVERED:*\n")
 		for _, svc := range upServices {
 			failTime := upDetails[svc]
 			duration := time.Since(failTime).Round(time.Second)
-			sb.WriteString("• ")
+			sb.WriteString("- ")
 			sb.WriteString(svc)
 			sb.WriteString("\n  Downtime: ")
 			sb.WriteString(duration.String())
