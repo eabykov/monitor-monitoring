@@ -37,14 +37,14 @@ type MonitorConfig struct {
 
 func loadMonitorConfig() MonitorConfig {
 	return MonitorConfig{
-		checkInterval:       getEnvDuration("CHECK_INTERVAL", 1*time.Minute),
-		requestTimeout:      getEnvDuration("REQUEST_TIMEOUT", 45*time.Second),
-		retryDelay:          getEnvDuration("RETRY_DELAY", 5*time.Second),
-		failureThreshold:    getEnvInt("FAILURE_THRESHOLD", 3),
-		notifyBatchWindow:   getEnvDuration("NOTIFY_BATCH_WINDOW", 15*time.Second),
-		maxBatchSize:        getEnvInt("MAX_BATCH_SIZE", 100),
-		maxConcurrentChecks: getEnvInt("MAX_CONCURRENT_CHECKS", 20),
-		maxResponseBodySize: int64(getEnvInt("MAX_RESPONSE_BODY_SIZE", 1048576)),
+		checkInterval:       getEnvDuration("CHECK_INTERVAL", 60*time.Second),
+		requestTimeout:      getEnvDuration("REQUEST_TIMEOUT", 20*time.Second),
+		retryDelay:          getEnvDuration("RETRY_DELAY", 10*time.Second),
+		failureThreshold:    getEnvInt("FAILURE_THRESHOLD", 2),
+		notifyBatchWindow:   getEnvDuration("NOTIFY_BATCH_WINDOW", 45*time.Second),
+		maxBatchSize:        getEnvInt("MAX_BATCH_SIZE", 200),
+		maxConcurrentChecks: getEnvInt("MAX_CONCURRENT_CHECKS", 32),
+		maxResponseBodySize: int64(getEnvInt("MAX_RESPONSE_BODY_SIZE", 2097152)),
 		dnsTimeout:          getEnvDuration("DNS_TIMEOUT", 5*time.Second),
 		tcpTimeout:          getEnvDuration("TCP_TIMEOUT", 10*time.Second),
 	}
