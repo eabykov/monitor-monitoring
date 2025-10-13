@@ -85,14 +85,14 @@ export TELEGRAM_CHAT_ID="-1001234567890"
 |----------|---------|----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | - | **Yes** | Your Telegram bot token from @BotFather |
 | `TELEGRAM_CHAT_ID` | - | **Yes** | Chat ID where notifications will be sent |
-| `CHECK_INTERVAL` | `1m` | No | How often to check all endpoints |
-| `REQUEST_TIMEOUT` | `45s` | No | HTTP request timeout per check |
-| `RETRY_DELAY` | `5s` | No | Wait time before retrying failed checks |
-| `FAILURE_THRESHOLD` | `3` | No | Consecutive failures before marking service DOWN |
-| `NOTIFY_BATCH_WINDOW` | `15s` | No | Maximum time to wait before sending notification batch |
-| `MAX_BATCH_SIZE` | `100` | No | Maximum number of notifications in one batch |
-| `MAX_CONCURRENT_CHECKS` | `20` | No | Maximum parallel health checks |
-| `MAX_RESPONSE_BODY_SIZE` | `1048576` | No | Maximum HTTP response body size in bytes (1MB) |
+| `CHECK_INTERVAL` | `60s` | No | How often to check all endpoints |
+| `REQUEST_TIMEOUT` | `20s` | No | HTTP request timeout per check |
+| `RETRY_DELAY` | `10s` | No | Wait time before retrying failed checks |
+| `FAILURE_THRESHOLD` | `2` | No | Consecutive failures before marking service DOWN |
+| `NOTIFY_BATCH_WINDOW` | `45s` | No | Maximum time to wait before sending notification batch |
+| `MAX_BATCH_SIZE` | `200` | No | Maximum number of notifications in one batch |
+| `MAX_CONCURRENT_CHECKS` | `32` | No | Maximum parallel health checks |
+| `MAX_RESPONSE_BODY_SIZE` | `2097152` | No | Maximum HTTP response body size in bytes (2MB) |
 | `DNS_TIMEOUT` | `5s` | No | Timeout for DNS queries |
 | `TCP_TIMEOUT` | `10s` | No | Timeout for TCP connection attempts |
 | `CONFIG_PATH` | `config.yaml` | No | Path to YAML configuration file |
