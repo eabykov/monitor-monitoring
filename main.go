@@ -171,6 +171,9 @@ func (t *TelegramNotifier) Send(ctx context.Context, message string) error {
 		"chat_id":    t.chatID,
 		"text":       message,
 		"parse_mode": "Markdown",
+		"link_preview_options": map[string]bool{
+			"is_disabled": true,
+		},
 	}
 	return sendJSONRequest(ctx, t.httpClient, url, payload)
 }
