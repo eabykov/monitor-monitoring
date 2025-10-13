@@ -86,15 +86,15 @@ export TELEGRAM_CHAT_ID="-1001234567890"
 | `TELEGRAM_BOT_TOKEN` | - | **Yes** | Your Telegram bot token from @BotFather |
 | `TELEGRAM_CHAT_ID` | - | **Yes** | Chat ID where notifications will be sent |
 | `CHECK_INTERVAL` | `60s` | No | How often to check all endpoints |
-| `REQUEST_TIMEOUT` | `20s` | No | HTTP request timeout per check |
-| `RETRY_DELAY` | `10s` | No | Wait time before retrying failed checks |
+| `REQUEST_TIMEOUT` | `10s` | No | HTTP request timeout per check |
+| `RETRY_DELAY` | `3s` | No | Wait time before retrying failed checks |
 | `FAILURE_THRESHOLD` | `2` | No | Consecutive failures before marking service DOWN |
-| `NOTIFY_BATCH_WINDOW` | `45s` | No | Maximum time to wait before sending notification batch |
-| `MAX_BATCH_SIZE` | `200` | No | Maximum number of notifications in one batch |
-| `MAX_CONCURRENT_CHECKS` | `32` | No | Maximum parallel health checks |
-| `MAX_RESPONSE_BODY_SIZE` | `2097152` | No | Maximum HTTP response body size in bytes (2MB) |
+| `NOTIFY_BATCH_WINDOW` | `25s` | No | Maximum time to wait before sending notification batch |
+| `MAX_BATCH_SIZE` | `50` | No | Maximum number of notifications in one batch |
+| `MAX_CONCURRENT_CHECKS` | `20` | No | Maximum parallel health checks |
+| `MAX_RESPONSE_BODY_SIZE` | `524288` | No | Maximum HTTP response body size in bytes (0.5MB) |
 | `DNS_TIMEOUT` | `5s` | No | Timeout for DNS queries |
-| `TCP_TIMEOUT` | `10s` | No | Timeout for TCP connection attempts |
+| `TCP_TIMEOUT` | `8s` | No | Timeout for TCP connection attempts |
 | `CONFIG_PATH` | `config.yaml` | No | Path to YAML configuration file |
 | `MATTERMOST_WEBHOOK_URL` | - | No | Mattermost webhook URL for fallback notifications |
 | `MONITOR_HOSTNAME` | (auto) | No | Rewrite the default hostname that will be displayed in notifications |
