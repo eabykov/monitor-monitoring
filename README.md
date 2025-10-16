@@ -1,10 +1,4 @@
-# Monitor Monitoring
-
-![Stars](https://img.shields.io/github/stars/eabykov/monitor-monitoring?style=flat)
-[![Go Report Card](https://goreportcard.com/badge/github.com/eabykov/monitor-monitoring)](https://goreportcard.com/report/github.com/eabykov/monitor-monitoring)
-![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/eabykov/monitor-monitoring?sort=semver)
-![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/eabykov/monitor-monitoring)
-![License](https://img.shields.io/github/license/eabykov/monitor-monitoring)
+# Monitor Monitoring ![Stars](https://img.shields.io/github/stars/eabykov/monitor-monitoring?style=flat) [![Go Report Card](https://goreportcard.com/badge/github.com/eabykov/monitor-monitoring)](https://goreportcard.com/report/github.com/eabykov/monitor-monitoring) ![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/eabykov/monitor-monitoring?sort=semver) ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/eabykov/monitor-monitoring) ![License](https://img.shields.io/github/license/eabykov/monitor-monitoring)
 
 Lightweight monitoring solution in a single 7MB binary. Monitors HTTP/HTTPS endpoints, DNS records, and TCP ports with instant notifications via Telegram, Slack, Discord, or Mattermost.
 
