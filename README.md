@@ -1,6 +1,10 @@
 # Monitor Monitoring
 
-<a target="_blank" href="https://github.com/eabykov/monitor-monitoring"><img src="https://img.shields.io/github/stars/eabykov/monitor-monitoring?style=flat" /></a> [![Go Report Card](https://goreportcard.com/badge/github.com/eabykov/monitor-monitoring)](https://goreportcard.com/report/github.com/eabykov/monitor-monitoring) ![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/eabykov/monitor-monitoring?sort=semver) ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/eabykov/monitor-monitoring) ![License](https://img.shields.io/github/license/eabykov/monitor-monitoring)
+![Stars](https://img.shields.io/github/stars/eabykov/monitor-monitoring?style=flat)
+[![Go Report Card](https://goreportcard.com/badge/github.com/eabykov/monitor-monitoring)](https://goreportcard.com/report/github.com/eabykov/monitor-monitoring)
+![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/eabykov/monitor-monitoring?sort=semver)
+![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/eabykov/monitor-monitoring)
+![License](https://img.shields.io/github/license/eabykov/monitor-monitoring)
 
 Lightweight monitoring solution in a single 7MB binary. Monitors HTTP/HTTPS endpoints, DNS records, and TCP ports with instant notifications via Telegram, Slack, Discord, or Mattermost.
 
@@ -247,53 +251,11 @@ endpoints:
     port: 587
 ```
 
-## How It Works
-
-### Monitoring Logic
-
-1. **Startup:** Load configuration, validate endpoints, initialize notifiers
-2. **Check Cycle:** Every `CHECK_INTERVAL`, all endpoints are checked concurrently
-3. **Retry Logic:** Failed checks are retried once after `RETRY_DELAY`
-4. **State Tracking:** Each endpoint maintains failure counter and down/up state
-5. **Alerting:** After `FAILURE_THRESHOLD` consecutive failures, service marked DOWN and notification queued
-6. **Recovery:** When DOWN service responds successfully, recovery notification queued
-7. **Batching:** Notifications are batched within `NOTIFY_BATCH_WINDOW` or when `MAX_BATCH_SIZE` reached
-8. **Delivery:** Notifications sent via primary notifier, fallback used if primary fails
-
-### Notification Format
-
-**Down Alert:**
-```
-Host: web01
-
-Services DOWN:
-- https://api.example.com
-  Failed at: 2024-01-15 14:30:25
-```
-
-**Recovery Alert:**
-```
-Host: web01
-
-Services RECOVERED:
-- https://api.example.com
-  Downtime: 5m30s
-```
-
-### Graceful Shutdown
-
-On SIGTERM/SIGINT:
-1. Stop accepting new checks
-2. Complete in-flight checks
-3. Flush notification queue
-4. Wait up to 30 seconds for cleanup
-5. Close idle connections
-
 ## Docker Deployment
 
 **Dockerfile:**
 ```dockerfile
-FROM golang:1.21-alpine AS builder
+FROM golang:1.25-alpine AS builder
 WORKDIR /app
 COPY . .
 RUN go build -o monitor-monitoring .
@@ -308,14 +270,12 @@ CMD ["./monitor-monitoring"]
 
 **docker-compose.yml:**
 ```yaml
-version: '3.8'
 services:
   monitor:
     build: .
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-      - CHECK_INTERVAL=60s
     volumes:
       - ./config.yaml:/root/config.yaml
     restart: unless-stopped
@@ -339,6 +299,8 @@ Restart=always
 RestartSec=10
 Environment="TELEGRAM_BOT_TOKEN=your_token"
 Environment="TELEGRAM_CHAT_ID=your_chat_id"
+MemoryMax=256M
+CPUQuota=10%
 
 [Install]
 WantedBy=multi-user.target
@@ -373,23 +335,3 @@ sudo systemctl start monitor-monitoring
 - Verify `NOTIFY_BATCH_WINDOW` isn't too long
 - Check notification queue isn't full
 - Review logs for dropped events
-
-## Performance Tips
-
-- Set `MAX_CONCURRENT_CHECKS` based on CPU cores (default 20 works well for most cases)
-- Use `CHECK_INTERVAL` based on criticality (production: 30-60s, dev: 5m)
-- Enable fallback notifier for critical monitoring
-- Monitor the monitor's own resource usage
-
-## License
-
-See [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions welcome! Please open an issue or submit a pull request.
-
-## Support
-
-- GitHub Issues: [Report bugs or request features](https://github.com/eabykov/monitor-monitoring/issues)
-- Documentation: Check this README and code comments
