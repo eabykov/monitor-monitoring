@@ -1,56 +1,69 @@
-# Monitor Monitoring <a target="_blank" href="https://github.com/eabykov/monitor-monitoring"><img src="https://img.shields.io/github/stars/eabykov/monitor-monitoring?style=flat" /></a> [![Go Report Card](https://goreportcard.com/badge/github.com/eabykov/monitor-monitoring)](https://goreportcard.com/report/github.com/eabykov/monitor-monitoring) ![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/eabykov/monitor-monitoring?sort=semver) ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/eabykov/monitor-monitoring) ![License](https://img.shields.io/github/license/eabykov/monitor-monitoring)
+# Monitor Monitoring
 
-Less than 7MB binary that outperforms enterprise monitoring giants consuming gigabytes of resources. While competitors require entire SRE/DevOps teams, this Go masterpiece delivers instant Telegram alerts for HTTP, DNS, and TCP in milliseconds with zero dependencies.
+<a target="_blank" href="https://github.com/eabykov/monitor-monitoring"><img src="https://img.shields.io/github/stars/eabykov/monitor-monitoring?style=flat" /></a> [![Go Report Card](https://goreportcard.com/badge/github.com/eabykov/monitor-monitoring)](https://goreportcard.com/report/github.com/eabykov/monitor-monitoring) ![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/eabykov/monitor-monitoring?sort=semver) ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/eabykov/monitor-monitoring) ![License](https://img.shields.io/github/license/eabykov/monitor-monitoring)
 
-## ✨ Features
+Lightweight monitoring solution in a single 7MB binary. Monitors HTTP/HTTPS endpoints, DNS records, and TCP ports with instant notifications via Telegram, Slack, Discord, or Mattermost.
 
-- ⚡ **Blazing concurrent checks** - All endpoints monitored in parallel with configurable concurrency limits
-- 🌐 **Multi-protocol mastery** - HTTP/HTTPS, DNS (A/AAAA/CNAME), and TCP monitoring in one unified tool
-- 🎯 **Smart failure detection** - Configurable failure thresholds with automatic retry logic
-- 📱 **Instant Telegram alerts** - Rich Markdown notifications with downtime tracking and recovery reports
-- 🦝 **Mattermost fallback** - Redundant notification channels ensure you never miss critical alerts
-- 📊 **Intelligent batching** - Anti-spam protection with configurable batch windows and size limits
-- 🛡️ **Production-hardened** - Memory monitoring, graceful shutdown, structured logging, and resource optimization
-- 🔧 **Zero-config deployment** - Environment variable configuration following 12-factor app principles
-- 🔄 **Smart retry mechanism** - Failed checks get a second chance with configurable delays
-- 📈 **Built-in observability** - Memory usage tracking, performance metrics, and detailed debug logging
+## Features
 
-## 🚀 Quick Start
+- **Concurrent monitoring** - Parallel endpoint checks with configurable concurrency limits
+- **Multi-protocol support** - HTTP/HTTPS, DNS (A/AAAA/CNAME), and TCP monitoring
+- **Smart failure detection** - Configurable failure thresholds with automatic retry logic
+- **Multi-channel notifications** - Telegram, Slack, Discord, and Mattermost support with fallback mechanism
+- **Intelligent batching** - Anti-spam protection with configurable batch windows and size limits
+- **Production-ready** - Memory monitoring, graceful shutdown, structured logging
+- **Zero dependencies** - Single binary with no external runtime dependencies
+- **12-factor app** - Environment variable configuration
+- **Built-in retry** - Automatic retry on failed checks with configurable delays
 
-### 1. Create Telegram Bot
+## Quick Start
 
-**Create your monitoring bot:**
-1. Open Telegram and message [@BotFather](https://t.me/BotFather)
-2. Send `/newbot` command
-3. Choose a name and username for your bot
-4. **Save the bot token** (format: `123456789:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`)
+### 1. Setup Notification Channel
 
-**Get your chat ID:**
-- **Option A**: Add [@userinfobot](https://t.me/userinfobot) to your group/channel, then send any message
-- **Option B**: Send a test message to your bot, then visit:
-  ```
-  https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates
-  ```
-  Look for `"chat":{"id":-1001234567890}` in the response
+#### Telegram (Recommended)
 
-**Add bot to your channel/group:**
-- Add your bot as an administrator to receive notifications
+**Create bot:**
+1. Message [@BotFather](https://t.me/BotFather) on Telegram
+2. Send `/newbot` and follow prompts
+3. Save the bot token (format: `123456789:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`)
 
-### 2. Install Monitor Monitoring
+**Get chat ID:**
+- Add [@userinfobot](https://t.me/userinfobot) to your group/channel
+- Send any message and copy the ID shown
+- Or visit: `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` after sending a message to your bot
 
-**Download and build:**
+**Add bot to channel/group:**
+- Add your bot as administrator to receive notifications
+
+#### Slack
+
+1. Create incoming webhook at `https://api.slack.com/messaging/webhooks`
+2. Copy webhook URL (format: `https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXX`)
+
+#### Discord
+
+1. Edit channel → Integrations → Webhooks → New Webhook
+2. Copy webhook URL (format: `https://discord.com/api/webhooks/123456789012345678/abcdefghijklmnopqrstuvwxyz`)
+
+#### Mattermost
+
+1. Integrations → Incoming Webhooks → Add Incoming Webhook
+2. Copy webhook URL (format: `https://mattermost.example.com/hooks/xxx`)
+
+### 2. Install
+
 ```bash
 git clone https://github.com/eabykov/monitor-monitoring.git
 cd monitor-monitoring
 go build -o monitor-monitoring .
 ```
 
-### 3. Configure Your Endpoints
+### 3. Configure Endpoints
 
 Create `config.yaml`:
+
 ```yaml
 endpoints:
-  # Quick HTTP check
   - url: https://api.github.com
     type: http
     method: GET
@@ -59,86 +72,108 @@ endpoints:
 
 ### 4. Set Environment Variables
 
+**Telegram:**
 ```bash
 export TELEGRAM_BOT_TOKEN="123456789:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
 export TELEGRAM_CHAT_ID="-1001234567890"
 ```
 
-### 5. Launch Your Monitor
+**Slack:**
+```bash
+export PRIMARY_NOTIFIER="slack"
+export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+```
+
+**Discord:**
+```bash
+export PRIMARY_NOTIFIER="discord"
+export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/YOUR/WEBHOOK/URL"
+```
+
+**Mattermost:**
+```bash
+export PRIMARY_NOTIFIER="mattermost"
+export MATTERMOST_WEBHOOK_URL="https://mattermost.example.com/hooks/YOUR_WEBHOOK_ID"
+```
+
+**With Fallback:**
+```bash
+export PRIMARY_NOTIFIER="telegram"
+export FALLBACK_NOTIFIER="slack"
+export TELEGRAM_BOT_TOKEN="your_telegram_token"
+export TELEGRAM_CHAT_ID="your_chat_id"
+export SLACK_WEBHOOK_URL="your_slack_webhook"
+```
+
+### 5. Run
 
 ```bash
 ./monitor-monitoring
 ```
 
-**Expected output:**
-```
-2024/01/15 14:30:25 INFO loaded configuration endpoints=1
-2024/01/15 14:30:25 INFO monitoring endpoint type=HTTP url=https://api.github.com method=GET expected_status=200 has_custom_headers=false
-2024/01/15 14:30:25 INFO starting service monitor hostname=web01 interval=1m0s gomaxprocs=8
-```
-
-## ⚙️ Configuration
+## Configuration
 
 ### Environment Variables
 
 | Variable | Default | Required | Description |
 |----------|---------|----------|-------------|
-| `TELEGRAM_BOT_TOKEN` | - | **Yes** | Your Telegram bot token from @BotFather |
-| `TELEGRAM_CHAT_ID` | - | **Yes** | Chat ID where notifications will be sent |
-| `CHECK_INTERVAL` | `60s` | No | How often to check all endpoints |
-| `REQUEST_TIMEOUT` | `10s` | No | HTTP request timeout per check |
-| `RETRY_DELAY` | `3s` | No | Wait time before retrying failed checks |
-| `FAILURE_THRESHOLD` | `2` | No | Consecutive failures before marking service DOWN |
-| `NOTIFY_BATCH_WINDOW` | `40s` | No | Maximum time to wait before sending notification batch |
-| `MAX_BATCH_SIZE` | `50` | No | Maximum number of notifications in one batch |
-| `MAX_CONCURRENT_CHECKS` | `20` | No | Maximum parallel health checks |
-| `MAX_RESPONSE_BODY_SIZE` | `524288` | No | Maximum HTTP response body size in bytes (0.5MB) |
-| `DNS_TIMEOUT` | `5s` | No | Timeout for DNS queries |
-| `TCP_TIMEOUT` | `8s` | No | Timeout for TCP connection attempts |
-| `CONFIG_PATH` | `config.yaml` | No | Path to YAML configuration file |
-| `MATTERMOST_WEBHOOK_URL` | - | No | Mattermost webhook URL for fallback notifications |
-| `MONITOR_HOSTNAME` | (auto) | No | Rewrite the default hostname that will be displayed in notifications |
+| `PRIMARY_NOTIFIER` | `telegram` | No | Primary notification channel: `telegram`, `slack`, `discord`, `mattermost` |
+| `FALLBACK_NOTIFIER` | _(empty)_ | No | Fallback notification channel if primary fails |
+| `TELEGRAM_BOT_TOKEN` | - | If using Telegram | Bot token from @BotFather |
+| `TELEGRAM_CHAT_ID` | - | If using Telegram | Chat/channel/group ID for notifications |
+| `SLACK_WEBHOOK_URL` | - | If using Slack | Incoming webhook URL |
+| `DISCORD_WEBHOOK_URL` | - | If using Discord | Webhook URL |
+| `MATTERMOST_WEBHOOK_URL` | - | If using Mattermost | Incoming webhook URL |
+| `CHECK_INTERVAL` | `60s` | No | Interval between check cycles |
+| `REQUEST_TIMEOUT` | `10s` | No | HTTP request timeout |
+| `RETRY_DELAY` | `3s` | No | Delay before retrying failed check |
+| `FAILURE_THRESHOLD` | `2` | No | Consecutive failures before alerting |
+| `NOTIFY_BATCH_WINDOW` | `40s` | No | Maximum wait time before sending batch |
+| `MAX_BATCH_SIZE` | `50` | No | Maximum events per notification batch |
+| `MAX_CONCURRENT_CHECKS` | `20` | No | Maximum parallel checks |
+| `MAX_RESPONSE_BODY_SIZE` | `524288` | No | Max HTTP response body size (bytes) |
+| `DNS_TIMEOUT` | `5s` | No | DNS query timeout |
+| `TCP_TIMEOUT` | `8s` | No | TCP connection timeout |
+| `CONFIG_PATH` | `config.yaml` | No | Path to YAML configuration |
+| `MONITOR_HOSTNAME` | _(auto-detected)_ | No | Hostname shown in notifications |
 
-### YAML Schema (`config.yaml`)
+### YAML Configuration (`config.yaml`)
 
-#### HTTP/HTTPS Endpoints
-Monitor web services, APIs, and websites:
+#### HTTP/HTTPS Monitoring
 
 ```yaml
 endpoints:
   # Basic HTTP check
   - url: https://example.com
-    type: http                    # Optional: defaults to 'http'
-    method: GET                   # Optional: GET, POST, PUT, DELETE, HEAD, PATCH, OPTIONS
-    expected_status: 200          # Optional: defaults to 200
+    type: http                    # Optional (default: http)
+    method: GET                   # Optional (default: GET)
+    expected_status: 200          # Optional (default: 200)
     
   # API with authentication
   - url: https://api.example.com/health
     type: http
     method: GET
     expected_status: 200
-    headers:                      # Optional: custom headers
-      Authorization: Bearer your-token-here
+    headers:
+      Authorization: Bearer your-token
       Accept: application/json
-      User-Agent: monitor-monitoring/1.0
       
-  # POST endpoint check
+  # POST endpoint
   - url: https://api.example.com/webhook
     type: http
     method: POST
     expected_status: 201
-    headers:
-      Content-Type: application/json
 ```
 
+**Supported HTTP methods:** GET, POST, PUT, DELETE, HEAD, PATCH, OPTIONS
+
 #### DNS Monitoring
-Verify DNS resolution and validate records:
 
 ```yaml
 endpoints:
-  # Basic A record check
+  # A record check
   - type: dns
-    host: example.com             # Required: hostname to resolve
+    host: example.com
     record_type: A                # Required: A, AAAA, or CNAME
     
   # A record with validation
@@ -151,96 +186,210 @@ endpoints:
   - type: dns
     host: ipv6.example.com
     record_type: AAAA
-    expected: 2001:db8::1         # Optional: validate specific IPv6
+    expected: 2001:db8::1
     
-  # CNAME record check
+  # CNAME record
   - type: dns
     host: www.example.com
     record_type: CNAME
-    expected: example.com         # Optional: validate CNAME target
-    
-  # Multiple DNS servers check
-  - type: dns
-    host: google.com
-    record_type: A                # Will resolve to multiple IPs
-    
-  # Cloudflare DNS check
-  - type: dns
-    host: one.one.one.one
-    record_type: A
-    expected: 1.1.1.1
+    expected: example.com
 ```
 
+**Supported record types:** A (IPv4), AAAA (IPv6), CNAME
+
 #### TCP Port Monitoring
-Check network service availability:
 
 ```yaml
 endpoints:
   # Database connection
   - type: tcp
-    host: db.example.com          # Required: hostname
-    port: 5432                    # Required: port number
+    host: db.example.com
+    port: 5432
     
-  # Alternative address format
-  - type: tcp
-    address: "database.company.com:5432"  # Alternative: full address
-    
-  # Web server
-  - type: tcp
-    host: web.example.com
-    port: 443
-    
-  # SMTP server
-  - type: tcp
-    host: mail.example.com
-    port: 587
-    
-  # Redis cache
+  # Alternative format
   - type: tcp
     address: "redis.example.com:6379"
     
-  # Custom application
+  # HTTPS port
   - type: tcp
-    host: app.example.com
-    port: 8080
+    host: web.example.com
+    port: 443
 ```
 
-#### Mixed Configuration Example
-Real-world monitoring setup:
+#### Complete Example
 
 ```yaml
 endpoints:
-  # Frontend website
+  # Website
   - url: https://www.company.com
     type: http
-    method: GET
-    expected_status: 200
     
-  # API health endpoint
+  # API health
   - url: https://api.company.com/health
     type: http
-    expected_status: 200
     headers:
       Authorization: Bearer monitoring-token
       
-  # Database connectivity
+  # Database
   - type: tcp
     host: prod-db.company.com
     port: 5432
     
-  # DNS resolution
+  # DNS
   - type: dns
     host: company.com
     record_type: A
     expected: 203.0.113.10
-    
-  # CDN endpoint
-  - url: https://cdn.company.com/status
-    type: http
-    expected_status: 200
     
   # Email server
   - type: tcp
     host: smtp.company.com
     port: 587
 ```
+
+## How It Works
+
+### Monitoring Logic
+
+1. **Startup:** Load configuration, validate endpoints, initialize notifiers
+2. **Check Cycle:** Every `CHECK_INTERVAL`, all endpoints are checked concurrently
+3. **Retry Logic:** Failed checks are retried once after `RETRY_DELAY`
+4. **State Tracking:** Each endpoint maintains failure counter and down/up state
+5. **Alerting:** After `FAILURE_THRESHOLD` consecutive failures, service marked DOWN and notification queued
+6. **Recovery:** When DOWN service responds successfully, recovery notification queued
+7. **Batching:** Notifications are batched within `NOTIFY_BATCH_WINDOW` or when `MAX_BATCH_SIZE` reached
+8. **Delivery:** Notifications sent via primary notifier, fallback used if primary fails
+
+### Notification Format
+
+**Down Alert:**
+```
+Host: web01
+
+Services DOWN:
+- https://api.example.com
+  Failed at: 2024-01-15 14:30:25
+```
+
+**Recovery Alert:**
+```
+Host: web01
+
+Services RECOVERED:
+- https://api.example.com
+  Downtime: 5m30s
+```
+
+### Graceful Shutdown
+
+On SIGTERM/SIGINT:
+1. Stop accepting new checks
+2. Complete in-flight checks
+3. Flush notification queue
+4. Wait up to 30 seconds for cleanup
+5. Close idle connections
+
+## Docker Deployment
+
+**Dockerfile:**
+```dockerfile
+FROM golang:1.21-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN go build -o monitor-monitoring .
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+COPY --from=builder /app/monitor-monitoring .
+COPY config.yaml .
+CMD ["./monitor-monitoring"]
+```
+
+**docker-compose.yml:**
+```yaml
+version: '3.8'
+services:
+  monitor:
+    build: .
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - CHECK_INTERVAL=60s
+    volumes:
+      - ./config.yaml:/root/config.yaml
+    restart: unless-stopped
+```
+
+## Systemd Service
+
+**Create `/etc/systemd/system/monitor-monitoring.service`:**
+
+```ini
+[Unit]
+Description=Monitor Monitoring Service
+After=network.target
+
+[Service]
+Type=simple
+User=monitor
+WorkingDirectory=/opt/monitor-monitoring
+ExecStart=/opt/monitor-monitoring/monitor-monitoring
+Restart=always
+RestartSec=10
+Environment="TELEGRAM_BOT_TOKEN=your_token"
+Environment="TELEGRAM_CHAT_ID=your_chat_id"
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Enable and start:**
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable monitor-monitoring
+sudo systemctl start monitor-monitoring
+```
+
+## Troubleshooting
+
+**No notifications received:**
+- Verify bot token and chat ID are correct
+- Ensure bot is added to the channel/group as administrator
+- Check logs for notification errors
+- Test webhook URLs manually with curl
+
+**High memory usage:**
+- Reduce `MAX_CONCURRENT_CHECKS`
+- Decrease `MAX_RESPONSE_BODY_SIZE`
+- Lower `MAX_BATCH_SIZE`
+
+**Frequent false positives:**
+- Increase `REQUEST_TIMEOUT`
+- Increase `FAILURE_THRESHOLD`
+- Check network connectivity
+
+**Missing alerts:**
+- Verify `NOTIFY_BATCH_WINDOW` isn't too long
+- Check notification queue isn't full
+- Review logs for dropped events
+
+## Performance Tips
+
+- Set `MAX_CONCURRENT_CHECKS` based on CPU cores (default 20 works well for most cases)
+- Use `CHECK_INTERVAL` based on criticality (production: 30-60s, dev: 5m)
+- Enable fallback notifier for critical monitoring
+- Monitor the monitor's own resource usage
+
+## License
+
+See [LICENSE](LICENSE) file for details.
+
+## Contributing
+
+Contributions welcome! Please open an issue or submit a pull request.
+
+## Support
+
+- GitHub Issues: [Report bugs or request features](https://github.com/eabykov/monitor-monitoring/issues)
+- Documentation: Check this README and code comments

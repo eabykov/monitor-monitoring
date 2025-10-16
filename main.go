@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -22,77 +23,29 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type MonitorConfig struct {
-	checkInterval       time.Duration
-	requestTimeout      time.Duration
-	retryDelay          time.Duration
-	failureThreshold    int
-	notifyBatchWindow   time.Duration
-	maxBatchSize        int
-	maxConcurrentChecks int
-	maxResponseBodySize int64
-	dnsTimeout          time.Duration
-	tcpTimeout          time.Duration
-}
-
-func loadMonitorConfig() MonitorConfig {
-	return MonitorConfig{
-		checkInterval:       getEnvDuration("CHECK_INTERVAL", 60*time.Second),
-		requestTimeout:      getEnvDuration("REQUEST_TIMEOUT", 10*time.Second),
-		retryDelay:          getEnvDuration("RETRY_DELAY", 3*time.Second),
-		failureThreshold:    getEnvInt("FAILURE_THRESHOLD", 2),
-		notifyBatchWindow:   getEnvDuration("NOTIFY_BATCH_WINDOW", 40*time.Second),
-		maxBatchSize:        getEnvInt("MAX_BATCH_SIZE", 50),
-		maxConcurrentChecks: getEnvInt("MAX_CONCURRENT_CHECKS", 20),
-		maxResponseBodySize: int64(getEnvInt("MAX_RESPONSE_BODY_SIZE", 524288)),
-		dnsTimeout:          getEnvDuration("DNS_TIMEOUT", 5*time.Second),
-		tcpTimeout:          getEnvDuration("TCP_TIMEOUT", 8*time.Second),
-	}
-}
-
-func getEnvDuration(key string, defaultVal time.Duration) time.Duration {
-	if val := os.Getenv(key); val != "" {
-		if d, err := time.ParseDuration(val); err == nil {
-			return d
-		}
-		slog.Warn("invalid duration, using default",
-			"key", key, "default", defaultVal)
-	}
-	return defaultVal
-}
-
-func getEnvInt(key string, defaultVal int) int {
-	if val := os.Getenv(key); val != "" {
-		var i int
-		if _, err := fmt.Sscanf(val, "%d", &i); err == nil && i > 0 {
-			return i
-		}
-		slog.Warn("invalid integer, using default",
-			"key", key, "default", defaultVal)
-	}
-	return defaultVal
-}
-
-func getHostname() string {
-	if hostname := os.Getenv("MONITOR_HOSTNAME"); hostname != "" {
-		return strings.TrimSpace(hostname)
-	}
-
-	hostname, err := os.Hostname()
-	if err != nil {
-		slog.Warn("failed to get system hostname, using fallback", "error", err)
-		return "unknown-host"
-	}
-
-	hostname = strings.TrimSpace(hostname)
-	if hostname == "" {
-		return "unknown-host"
-	}
-
-	return hostname
-}
-
 type Config struct {
+	CheckInterval       time.Duration `env:"CHECK_INTERVAL" default:"60s"`
+	RequestTimeout      time.Duration `env:"REQUEST_TIMEOUT" default:"10s"`
+	RetryDelay          time.Duration `env:"RETRY_DELAY" default:"3s"`
+	FailureThreshold    int           `env:"FAILURE_THRESHOLD" default:"2"`
+	NotifyBatchWindow   time.Duration `env:"NOTIFY_BATCH_WINDOW" default:"40s"`
+	MaxBatchSize        int           `env:"MAX_BATCH_SIZE" default:"50"`
+	MaxConcurrentChecks int           `env:"MAX_CONCURRENT_CHECKS" default:"20"`
+	MaxResponseBodySize int64         `env:"MAX_RESPONSE_BODY_SIZE" default:"524288"`
+	DNSTimeout          time.Duration `env:"DNS_TIMEOUT" default:"5s"`
+	TCPTimeout          time.Duration `env:"TCP_TIMEOUT" default:"8s"`
+	Hostname            string        `env:"MONITOR_HOSTNAME"`
+	ConfigPath          string        `env:"CONFIG_PATH" default:"config.yaml"`
+
+	PrimaryNotifier  string `env:"PRIMARY_NOTIFIER" default:"telegram"`
+	FallbackNotifier string `env:"FALLBACK_NOTIFIER" default:""`
+
+	TelegramToken  string `env:"TELEGRAM_BOT_TOKEN"`
+	TelegramChatID string `env:"TELEGRAM_CHAT_ID"`
+	MattermostURL  string `env:"MATTERMOST_WEBHOOK_URL"`
+	SlackURL       string `env:"SLACK_WEBHOOK_URL"`
+	DiscordURL     string `env:"DISCORD_WEBHOOK_URL"`
+
 	Endpoints []Endpoint `yaml:"endpoints"`
 }
 
@@ -128,23 +81,6 @@ type ServiceState struct {
 	consecutiveFails int
 	isDown           bool
 	firstFailTime    time.Time
-	lastCheckTime    time.Time
-}
-
-type Monitor struct {
-	config         Config
-	monitorConfig  MonitorConfig
-	states         sync.Map
-	telegramToken  string
-	telegramChatID string
-	mattermostURL  string
-	httpClient     *http.Client
-	resolver       *net.Resolver
-	notifyQueue    chan *NotifyEvent
-	semaphore      chan struct{}
-	wg             sync.WaitGroup
-	shutdown       chan struct{}
-	hostname       string
 }
 
 type NotifyEvent struct {
@@ -159,344 +95,334 @@ type Notifier interface {
 	Name() string
 }
 
-type TelegramNotifier struct {
-	token      string
-	chatID     string
+type WebhookNotifier struct {
+	name       string
+	url        string
 	httpClient *http.Client
+	formatFunc func(string) map[string]interface{}
 }
 
-func (t *TelegramNotifier) Send(ctx context.Context, message string) error {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", t.token)
-	payload := map[string]interface{}{
-		"chat_id":    t.chatID,
-		"text":       message,
-		"parse_mode": "Markdown",
-		"link_preview_options": map[string]bool{
-			"is_disabled": true,
-		},
-	}
-	return sendJSONRequest(ctx, t.httpClient, url, payload)
-}
-
-func (t *TelegramNotifier) Name() string {
-	return "Telegram"
-}
-
-type MattermostNotifier struct {
-	webhookURL string
-	httpClient *http.Client
-}
-
-func (m *MattermostNotifier) Send(ctx context.Context, message string) error {
-	payload := map[string]string{"text": message}
-	return sendJSONRequest(ctx, m.httpClient, m.webhookURL, payload)
-}
-
-func (m *MattermostNotifier) Name() string {
-	return "Mattermost"
-}
-
-func sendJSONRequest(ctx context.Context, client *http.Client, targetURL string, payload interface{}) error {
+func (w *WebhookNotifier) Send(ctx context.Context, message string) error {
+	payload := w.formatFunc(message)
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal payload: %w", err)
+		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.url, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req)
+	resp, err := w.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("do request: %w", err)
+		return err
 	}
 	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			slog.Warn("failed to close response body", "error", cerr)
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			slog.Warn("failed to close response body", "error", closeErr)
 		}
 	}()
 
-	limited := io.LimitReader(resp.Body, 1<<20)
-	if _, err := io.Copy(io.Discard, limited); err != nil {
-		return fmt.Errorf("drain body: %w", err)
+	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20)); err != nil {
+		slog.Warn("failed to drain response body", "error", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("status %d", resp.StatusCode)
 	}
-
 	return nil
 }
 
-func maskSensitiveString(s string, showLast int) string {
-	if len(s) <= showLast {
-		return "***"
-	}
-	return strings.Repeat("*", len(s)-showLast) + s[len(s)-showLast:]
+func (w *WebhookNotifier) Name() string { return w.name }
+
+type Monitor struct {
+	config      Config
+	states      sync.Map
+	httpClient  *http.Client
+	resolver    *net.Resolver
+	notifyQueue chan *NotifyEvent
+	semaphore   chan struct{}
+	wg          sync.WaitGroup
+	shutdown    chan struct{}
 }
 
-func sanitizeURL(rawURL string) string {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return "[invalid-url]"
+func loadConfig() (*Config, error) {
+	cfg := &Config{}
+
+	// Load defaults using reflection
+	v := reflect.ValueOf(cfg).Elem()
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		envKey := field.Tag.Get("env")
+		defaultVal := field.Tag.Get("default")
+
+		if envKey == "" {
+			continue
+		}
+
+		envVal := os.Getenv(envKey)
+		if envVal == "" {
+			envVal = defaultVal
+		}
+		if envVal == "" {
+			continue
+		}
+
+		fieldVal := v.Field(i)
+		switch fieldVal.Kind() {
+		case reflect.String:
+			fieldVal.SetString(envVal)
+		case reflect.Int, reflect.Int64:
+			if field.Type == reflect.TypeOf(time.Duration(0)) {
+				if d, err := time.ParseDuration(envVal); err == nil {
+					fieldVal.SetInt(int64(d))
+				}
+			} else {
+				var n int
+				if _, err := fmt.Sscanf(envVal, "%d", &n); err == nil && n > 0 {
+					fieldVal.SetInt(int64(n))
+				}
+			}
+		}
 	}
-	parsed.RawQuery = ""
-	parsed.User = nil
-	return parsed.String()
+
+	if cfg.Hostname == "" {
+		if h, err := os.Hostname(); err == nil {
+			cfg.Hostname = strings.TrimSpace(h)
+		}
+		if cfg.Hostname == "" {
+			cfg.Hostname = "unknown-host"
+		}
+	}
+
+	// Load endpoints from YAML
+	data, err := os.ReadFile(cfg.ConfigPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var yamlCfg struct {
+		Endpoints []Endpoint `yaml:"endpoints"`
+	}
+	if err := yaml.Unmarshal(data, &yamlCfg); err != nil {
+		return nil, err
+	}
+	cfg.Endpoints = yamlCfg.Endpoints
+
+	return cfg, nil
 }
 
 func validateEndpoint(ep *Endpoint) error {
-	endpointType := strings.ToLower(ep.Type)
-	if endpointType == "" {
-		endpointType = "http"
-		ep.Type = endpointType
-	} else {
-		ep.Type = endpointType
+	if ep.Type == "" {
+		ep.Type = "http"
 	}
+	ep.Type = strings.ToLower(ep.Type)
 
-	switch endpointType {
+	switch ep.Type {
 	case "http":
 		if ep.URL == "" {
-			return errors.New("URL is required for HTTP endpoint")
+			return errors.New("URL required")
 		}
-
 		parsed, err := url.Parse(ep.URL)
-		if err != nil {
-			return fmt.Errorf("invalid URL: %w", err)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			return errors.New("invalid URL")
 		}
-
-		if parsed.Scheme != "http" && parsed.Scheme != "https" {
-			return fmt.Errorf("URL scheme must be http or https, got: %s", parsed.Scheme)
-		}
-
-		if parsed.Host == "" {
-			return errors.New("URL must have a host")
-		}
-
 		if ep.Method != "" {
-			method := strings.ToUpper(ep.Method)
-			validMethods := map[string]bool{
-				"GET": true, "POST": true, "PUT": true, "PATCH": true,
-				"DELETE": true, "HEAD": true, "OPTIONS": true,
-			}
-			if !validMethods[method] {
-				return fmt.Errorf("invalid HTTP method: %s", ep.Method)
-			}
-		}
-
-		if ep.ExpectedStatus != 0 && (ep.ExpectedStatus < 100 || ep.ExpectedStatus > 599) {
-			return fmt.Errorf("invalid expected status code: %d", ep.ExpectedStatus)
+			ep.Method = strings.ToUpper(ep.Method)
 		}
 
 	case "dns":
-		if ep.Host == "" {
-			return errors.New("host is required for DNS endpoint")
+		if ep.Host == "" || ep.RecordType == "" {
+			return errors.New("host and record_type required")
 		}
-
-		recordType := strings.ToUpper(ep.RecordType)
-		if recordType == "" {
-			return errors.New("record_type is required for DNS endpoint")
+		ep.RecordType = strings.ToUpper(ep.RecordType)
+		if ep.RecordType != "A" && ep.RecordType != "AAAA" && ep.RecordType != "CNAME" {
+			return errors.New("unsupported DNS type")
 		}
-		ep.RecordType = recordType
-
-		validTypes := map[string]bool{"A": true, "AAAA": true, "CNAME": true}
-		if !validTypes[recordType] {
-			return fmt.Errorf("unsupported DNS record type: %s (supported: A, AAAA, CNAME)", recordType)
-		}
-
-		if ep.Expected != "" {
-			switch recordType {
-			case "A":
-				if net.ParseIP(ep.Expected) == nil || !strings.Contains(ep.Expected, ".") {
-					return fmt.Errorf("invalid IPv4 address in expected: %s", ep.Expected)
-				}
-			case "AAAA":
-				if net.ParseIP(ep.Expected) == nil || !strings.Contains(ep.Expected, ":") {
-					return fmt.Errorf("invalid IPv6 address in expected: %s", ep.Expected)
-				}
-			case "CNAME":
-				ep.Expected = strings.TrimSuffix(ep.Expected, ".")
-			}
-		}
+		ep.Expected = strings.TrimSuffix(ep.Expected, ".")
 
 	case "tcp":
-		if ep.Address == "" && ep.Host == "" {
-			return errors.New("address or host is required for TCP endpoint")
-		}
-
 		if ep.Address == "" {
-			if ep.Port <= 0 || ep.Port > 65535 {
-				return fmt.Errorf("invalid port: %d", ep.Port)
+			if ep.Host == "" || ep.Port <= 0 || ep.Port > 65535 {
+				return errors.New("valid address or host:port required")
 			}
 			ep.Address = fmt.Sprintf("%s:%d", ep.Host, ep.Port)
 		}
 
-		if _, _, err := net.SplitHostPort(ep.Address); err != nil {
-			return fmt.Errorf("invalid TCP address: %w", err)
-		}
-
 	default:
-		return fmt.Errorf("unsupported endpoint type: %s", ep.Type)
+		return errors.New("unsupported type")
 	}
-
 	return nil
 }
 
-func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-	slog.SetDefault(logger)
-
-	if err := run(); err != nil {
-		slog.Error("fatal error", "error", err)
-		os.Exit(1)
+func createNotifiers(cfg *Config, client *http.Client) ([]Notifier, error) {
+	notifierMap := map[string]func() (Notifier, error){
+		"telegram": func() (Notifier, error) {
+			if cfg.TelegramToken == "" || cfg.TelegramChatID == "" {
+				return nil, errors.New("telegram credentials missing")
+			}
+			return &WebhookNotifier{
+				name:       "Telegram",
+				url:        fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", cfg.TelegramToken),
+				httpClient: client,
+				formatFunc: func(msg string) map[string]interface{} {
+					return map[string]interface{}{
+						"chat_id":              cfg.TelegramChatID,
+						"text":                 msg,
+						"parse_mode":           "Markdown",
+						"link_preview_options": map[string]bool{"is_disabled": true},
+					}
+				},
+			}, nil
+		},
+		"mattermost": func() (Notifier, error) {
+			if cfg.MattermostURL == "" {
+				return nil, errors.New("mattermost URL missing")
+			}
+			return &WebhookNotifier{
+				name:       "Mattermost",
+				url:        cfg.MattermostURL,
+				httpClient: client,
+				formatFunc: func(msg string) map[string]interface{} {
+					return map[string]interface{}{"text": msg}
+				},
+			}, nil
+		},
+		"slack": func() (Notifier, error) {
+			if cfg.SlackURL == "" {
+				return nil, errors.New("slack URL missing")
+			}
+			return &WebhookNotifier{
+				name:       "Slack",
+				url:        cfg.SlackURL,
+				httpClient: client,
+				formatFunc: func(msg string) map[string]interface{} {
+					// Convert markdown to Slack's mrkdwn format
+					msg = strings.ReplaceAll(msg, "*", "*")
+					msg = strings.ReplaceAll(msg, "`", "`")
+					return map[string]interface{}{
+						"text":   msg,
+						"mrkdwn": true,
+					}
+				},
+			}, nil
+		},
+		"discord": func() (Notifier, error) {
+			if cfg.DiscordURL == "" {
+				return nil, errors.New("discord URL missing")
+			}
+			return &WebhookNotifier{
+				name:       "Discord",
+				url:        cfg.DiscordURL,
+				httpClient: client,
+				formatFunc: func(msg string) map[string]interface{} {
+					// Convert markdown to Discord format
+					msg = strings.ReplaceAll(msg, "*", "**")
+					return map[string]interface{}{"content": msg}
+				},
+			}, nil
+		},
 	}
+
+	var notifiers []Notifier
+	for _, name := range []string{cfg.PrimaryNotifier, cfg.FallbackNotifier} {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" {
+			continue
+		}
+
+		createFunc, ok := notifierMap[name]
+		if !ok {
+			slog.Warn("unknown notifier", "name", name)
+			continue
+		}
+
+		notifier, err := createFunc()
+		if err != nil {
+			slog.Warn("failed to create notifier", "name", name, "error", err)
+			continue
+		}
+
+		notifiers = append(notifiers, notifier)
+		slog.Info("notifier configured", "name", name, "position",
+			map[bool]string{true: "primary", false: "fallback"}[len(notifiers) == 1])
+	}
+
+	if len(notifiers) == 0 {
+		return nil, errors.New("no valid notifiers configured")
+	}
+
+	return notifiers, nil
 }
 
-func run() error {
-	telegramToken := os.Getenv("TELEGRAM_BOT_TOKEN")
-	telegramChatID := os.Getenv("TELEGRAM_CHAT_ID")
-	mattermostURL := os.Getenv("MATTERMOST_WEBHOOK_URL")
+func main() {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	if telegramToken == "" || telegramChatID == "" {
-		return errors.New("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
-	}
-
-	if !strings.Contains(telegramToken, ":") || len(telegramToken) < 20 {
-		return errors.New("TELEGRAM_BOT_TOKEN appears to be invalid")
-	}
-
-	if mattermostURL != "" {
-		parsed, err := url.Parse(mattermostURL)
-		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-			return fmt.Errorf("MATTERMOST_WEBHOOK_URL is invalid: %w", err)
-		}
-	}
-
-	hostname := getHostname()
-
-	configPath := "config.yaml"
-	if cp := os.Getenv("CONFIG_PATH"); cp != "" {
-		configPath = cp
-	}
-
-	data, err := os.ReadFile(configPath)
+	cfg, err := loadConfig()
 	if err != nil {
-		return fmt.Errorf("read config: %w", err)
+		slog.Error("config load failed", "error", err)
+		os.Exit(1)
 	}
 
-	var config Config
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return fmt.Errorf("parse config: %w", err)
+	if len(cfg.Endpoints) == 0 {
+		slog.Error("no endpoints configured")
+		os.Exit(1)
 	}
 
-	if len(config.Endpoints) == 0 {
-		return errors.New("no endpoints configured")
-	}
-
-	for i := range config.Endpoints {
-		if err := validateEndpoint(&config.Endpoints[i]); err != nil {
-			return fmt.Errorf("endpoint %d validation failed: %w", i, err)
+	for i := range cfg.Endpoints {
+		if err := validateEndpoint(&cfg.Endpoints[i]); err != nil {
+			slog.Error("endpoint validation failed", "index", i, "error", err)
+			os.Exit(1)
 		}
 	}
 
-	slog.Info("loaded configuration", "endpoints", len(config.Endpoints))
-	for _, ep := range config.Endpoints {
-		logEndpoint(ep)
-	}
-
-	monitorConfig := loadMonitorConfig()
-
-	if monitorConfig.checkInterval < time.Second {
-		return errors.New("CHECK_INTERVAL must be at least 1 second")
-	}
-	if monitorConfig.failureThreshold < 1 {
-		return errors.New("FAILURE_THRESHOLD must be at least 1")
-	}
-	if monitorConfig.maxConcurrentChecks < 1 {
-		return errors.New("MAX_CONCURRENT_CHECKS must be at least 1")
-	}
-
-	slog.Info("monitor configuration",
-		"hostname", hostname,
-		"check_interval", monitorConfig.checkInterval,
-		"request_timeout", monitorConfig.requestTimeout,
-		"retry_delay", monitorConfig.retryDelay,
-		"failure_threshold", monitorConfig.failureThreshold,
-		"notify_batch_window", monitorConfig.notifyBatchWindow,
-		"max_batch_size", monitorConfig.maxBatchSize,
-		"max_concurrent_checks", monitorConfig.maxConcurrentChecks,
-		"max_response_body_size", monitorConfig.maxResponseBodySize,
-		"dns_timeout", monitorConfig.dnsTimeout,
-		"tcp_timeout", monitorConfig.tcpTimeout,
-		"telegram_chat_id", maskSensitiveString(telegramChatID, 4),
-		"mattermost_enabled", mattermostURL != "")
+	slog.Info("configuration loaded",
+		"endpoints", len(cfg.Endpoints),
+		"hostname", cfg.Hostname,
+		"primary_notifier", cfg.PrimaryNotifier,
+		"fallback_notifier", cfg.FallbackNotifier)
 
 	transport := &http.Transport{
-		MaxIdleConns:          20,
-		MaxIdleConnsPerHost:   2,
-		IdleConnTimeout:       30 * time.Second,
-		MaxConnsPerHost:       5,
-		DisableKeepAlives:     false,
-		DisableCompression:    false,
-		ResponseHeaderTimeout: 10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConns:        20,
+		MaxIdleConnsPerHost: 2,
+		IdleConnTimeout:     30 * time.Second,
 		DialContext: (&net.Dialer{
-			Timeout:   monitorConfig.tcpTimeout,
+			Timeout:   cfg.TCPTimeout,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 	}
 
 	httpClient := &http.Client{
-		Timeout:   monitorConfig.requestTimeout,
+		Timeout:   cfg.RequestTimeout,
 		Transport: transport,
 	}
 
+	notifiers, err := createNotifiers(cfg, httpClient)
+	if err != nil {
+		slog.Error("notifier setup failed", "error", err)
+		os.Exit(1)
+	}
+
 	resolver := &net.Resolver{
-		PreferGo:     true,
-		StrictErrors: true,
+		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{
-				Timeout: monitorConfig.dnsTimeout,
-			}
-			return d.DialContext(ctx, network, address)
+			return (&net.Dialer{Timeout: cfg.DNSTimeout}).DialContext(ctx, network, address)
 		},
-	}
-
-	notifiers := []Notifier{
-		&TelegramNotifier{
-			token:      telegramToken,
-			chatID:     telegramChatID,
-			httpClient: httpClient,
-		},
-	}
-
-	if mattermostURL != "" {
-		notifiers = append(notifiers, &MattermostNotifier{
-			webhookURL: mattermostURL,
-			httpClient: httpClient,
-		})
-		slog.Info("mattermost fallback enabled")
 	}
 
 	monitor := &Monitor{
-		config:         config,
-		monitorConfig:  monitorConfig,
-		telegramToken:  telegramToken,
-		telegramChatID: telegramChatID,
-		mattermostURL:  mattermostURL,
-		httpClient:     httpClient,
-		resolver:       resolver,
-		notifyQueue:    make(chan *NotifyEvent, 100),
-		semaphore:      make(chan struct{}, monitorConfig.maxConcurrentChecks),
-		shutdown:       make(chan struct{}),
-		hostname:       hostname,
+		config:      *cfg,
+		httpClient:  httpClient,
+		resolver:    resolver,
+		notifyQueue: make(chan *NotifyEvent, 100),
+		semaphore:   make(chan struct{}, cfg.MaxConcurrentChecks),
+		shutdown:    make(chan struct{}),
 	}
 
-	for _, ep := range config.Endpoints {
+	for _, ep := range cfg.Endpoints {
 		monitor.states.Store(ep.GetIdentifier(), &ServiceState{})
 	}
 
@@ -509,26 +435,17 @@ func run() error {
 	monitor.wg.Add(1)
 	go monitor.memoryMonitor(ctx)
 
-	slog.Info("starting service monitor",
-		"interval", monitorConfig.checkInterval,
-		"gomaxprocs", runtime.GOMAXPROCS(0))
-
-	ticker := time.NewTicker(monitorConfig.checkInterval)
+	ticker := time.NewTicker(cfg.CheckInterval)
 	defer ticker.Stop()
 
-	slog.Info("running initial health check")
 	monitor.checkAllServices(ctx)
-	slog.Info("initial check completed")
 
 	for {
 		select {
 		case <-ticker.C:
 			monitor.checkAllServices(ctx)
 		case <-ctx.Done():
-			slog.Info("received shutdown signal, stopping gracefully")
-
 			close(monitor.shutdown)
-
 			ticker.Stop()
 
 			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -545,70 +462,26 @@ func run() error {
 			case <-done:
 				slog.Info("shutdown complete")
 			case <-shutdownCtx.Done():
-				slog.Warn("shutdown timeout, forcing exit")
+				slog.Warn("shutdown timeout")
 			}
 
 			transport.CloseIdleConnections()
-
-			return nil
+			return
 		}
-	}
-}
-
-func logEndpoint(ep Endpoint) {
-	switch ep.Type {
-	case "dns":
-		slog.Info("monitoring endpoint",
-			"type", "DNS",
-			"host", ep.Host,
-			"record_type", strings.ToUpper(ep.RecordType),
-			"has_expected", ep.Expected != "")
-	case "tcp":
-		addr := ep.Address
-		if addr == "" {
-			addr = fmt.Sprintf("%s:%d", ep.Host, ep.Port)
-		}
-		slog.Info("monitoring endpoint",
-			"type", "TCP",
-			"address", addr)
-	default:
-		method := ep.Method
-		if method == "" {
-			method = http.MethodGet
-		}
-		expectedStatus := ep.ExpectedStatus
-		if expectedStatus == 0 {
-			expectedStatus = http.StatusOK
-		}
-		slog.Info("monitoring endpoint",
-			"type", "HTTP",
-			"url", sanitizeURL(ep.URL),
-			"method", method,
-			"expected_status", expectedStatus,
-			"has_custom_headers", len(ep.Headers) > 0)
 	}
 }
 
 func (m *Monitor) memoryMonitor(ctx context.Context) {
 	defer m.wg.Done()
-
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			var memStats runtime.MemStats
-			runtime.ReadMemStats(&memStats)
-
-			slog.Info("memory stats",
-				"alloc_mb", memStats.Alloc/1024/1024,
-				"sys_mb", memStats.Sys/1024/1024,
-				"num_gc", memStats.NumGC,
-				"goroutines", runtime.NumGoroutine())
-
-			if memStats.Alloc > 500*1024*1024 {
-				slog.Warn("high memory usage detected", "alloc_mb", memStats.Alloc/1024/1024)
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			if ms.Alloc > 500*1024*1024 {
 				runtime.GC()
 			}
 		case <-ctx.Done():
@@ -623,12 +496,9 @@ func (m *Monitor) checkAllServices(ctx context.Context) {
 	}
 
 	var wg sync.WaitGroup
-	startTime := time.Now()
-
 	for _, ep := range m.config.Endpoints {
 		select {
 		case <-m.shutdown:
-			slog.Debug("shutdown signal received, stopping health checks")
 			wg.Wait()
 			return
 		default:
@@ -637,23 +507,16 @@ func (m *Monitor) checkAllServices(ctx context.Context) {
 		wg.Add(1)
 		go func(endpoint Endpoint) {
 			defer wg.Done()
-
 			select {
 			case m.semaphore <- struct{}{}:
 				defer func() { <-m.semaphore }()
 				m.checkService(ctx, endpoint)
 			case <-ctx.Done():
-				return
 			case <-m.shutdown:
-				return
 			}
 		}(ep)
 	}
-
 	wg.Wait()
-
-	duration := time.Since(startTime)
-	slog.Debug("health check cycle completed", "duration", duration.Round(time.Millisecond))
 }
 
 func (m *Monitor) checkService(ctx context.Context, ep Endpoint) {
@@ -661,31 +524,22 @@ func (m *Monitor) checkService(ctx context.Context, ep Endpoint) {
 		return
 	}
 
-	identifier := ep.GetIdentifier()
 	success := m.performCheck(ctx, ep)
-
 	if !success && ctx.Err() == nil {
 		select {
 		case <-m.shutdown:
 			return
 		default:
 		}
-
-		retryCtx, cancel := context.WithTimeout(ctx, m.monitorConfig.retryDelay+m.monitorConfig.requestTimeout)
-		defer cancel()
-
-		time.Sleep(m.monitorConfig.retryDelay)
-
-		if retryCtx.Err() == nil {
-			success = m.performCheck(retryCtx, ep)
-		}
+		time.Sleep(m.config.RetryDelay)
+		success = m.performCheck(ctx, ep)
 	}
 
-	m.updateState(identifier, success)
+	m.updateState(ep.GetIdentifier(), success)
 }
 
 func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
-	switch strings.ToLower(ep.Type) {
+	switch ep.Type {
 	case "dns":
 		return m.performDNSCheck(ctx, ep)
 	case "tcp":
@@ -695,168 +549,71 @@ func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 	}
 }
 
-type dnsLookupResult struct {
-	records   []string
-	recordStr string
-	err       error
-}
-
-func (m *Monitor) lookupIPv4(ctx context.Context, host string) dnsLookupResult {
-	ips, err := m.resolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return dnsLookupResult{err: err}
-	}
-
-	var ipv4s []string
-	for _, ip := range ips {
-		if ip.IP.To4() != nil {
-			ipv4s = append(ipv4s, ip.IP.String())
-		}
-	}
-
-	if len(ipv4s) == 0 {
-		return dnsLookupResult{err: errors.New("no IPv4 addresses found")}
-	}
-
-	return dnsLookupResult{
-		records:   ipv4s,
-		recordStr: strings.Join(ipv4s, ", "),
-	}
-}
-
-func (m *Monitor) lookupIPv6(ctx context.Context, host string) dnsLookupResult {
-	ips, err := m.resolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return dnsLookupResult{err: err}
-	}
-
-	var ipv6s []string
-	for _, ip := range ips {
-		if ip.IP.To4() == nil && ip.IP.To16() != nil {
-			ipv6s = append(ipv6s, ip.IP.String())
-		}
-	}
-
-	if len(ipv6s) == 0 {
-		return dnsLookupResult{err: errors.New("no IPv6 addresses found")}
-	}
-
-	return dnsLookupResult{
-		records:   ipv6s,
-		recordStr: strings.Join(ipv6s, ", "),
-	}
-}
-
-func (m *Monitor) lookupCNAME(ctx context.Context, host string) dnsLookupResult {
-	cname, err := m.resolver.LookupCNAME(ctx, host)
-	if err != nil {
-		return dnsLookupResult{err: err}
-	}
-
-	cname = strings.TrimSuffix(cname, ".")
-	return dnsLookupResult{
-		records:   []string{cname},
-		recordStr: cname,
-	}
-}
-
-func validateDNSResult(result dnsLookupResult, expected string) bool {
-	if expected == "" {
-		return true
-	}
-
-	expected = strings.TrimSuffix(expected, ".")
-	for _, record := range result.records {
-		if record == expected {
-			return true
-		}
-	}
-	return false
-}
-
 func (m *Monitor) performDNSCheck(ctx context.Context, ep Endpoint) bool {
-	recordType := strings.ToUpper(ep.RecordType)
-	startTime := time.Now()
-
-	dnsCtx, cancel := context.WithTimeout(ctx, m.monitorConfig.dnsTimeout)
+	dnsCtx, cancel := context.WithTimeout(ctx, m.config.DNSTimeout)
 	defer cancel()
 
-	var result dnsLookupResult
+	var records []string
+	var err error
 
-	switch recordType {
+	switch ep.RecordType {
 	case "A":
-		result = m.lookupIPv4(dnsCtx, ep.Host)
+		var ips []net.IPAddr
+		ips, err = m.resolver.LookupIPAddr(dnsCtx, ep.Host)
+		for _, ip := range ips {
+			if ip.IP.To4() != nil {
+				records = append(records, ip.IP.String())
+			}
+		}
+		if len(records) == 0 && err == nil {
+			err = errors.New("no IPv4 found")
+		}
+
 	case "AAAA":
-		result = m.lookupIPv6(dnsCtx, ep.Host)
+		var ips []net.IPAddr
+		ips, err = m.resolver.LookupIPAddr(dnsCtx, ep.Host)
+		for _, ip := range ips {
+			if ip.IP.To4() == nil && ip.IP.To16() != nil {
+				records = append(records, ip.IP.String())
+			}
+		}
+		if len(records) == 0 && err == nil {
+			err = errors.New("no IPv6 found")
+		}
+
 	case "CNAME":
-		result = m.lookupCNAME(dnsCtx, ep.Host)
-	default:
-		slog.Error("unsupported DNS record type", "type", recordType)
+		var cname string
+		cname, err = m.resolver.LookupCNAME(dnsCtx, ep.Host)
+		if err == nil {
+			records = []string{strings.TrimSuffix(cname, ".")}
+		}
+	}
+
+	if err != nil {
 		return false
 	}
 
-	if result.err != nil {
-		slog.Warn("DNS lookup failed",
-			"host", ep.Host,
-			"type", recordType,
-			"error", result.err)
-		return false
+	// Validate expected value if provided
+	if ep.Expected != "" {
+		found := false
+		for _, record := range records {
+			if record == ep.Expected {
+				found = true
+				break
+			}
+		}
+		return found
 	}
-
-	if !validateDNSResult(result, ep.Expected) {
-		slog.Warn("DNS record mismatch",
-			"host", ep.Host,
-			"type", recordType,
-			"expected", ep.Expected,
-			"got", result.recordStr)
-		return false
-	}
-
-	duration := time.Since(startTime)
-	slog.Debug("DNS check successful",
-		"host", ep.Host,
-		"type", recordType,
-		"result", result.recordStr,
-		"duration", duration.Round(time.Millisecond))
 
 	return true
 }
 
 func (m *Monitor) performTCPCheck(ctx context.Context, ep Endpoint) bool {
-	address := ep.Address
-	if address == "" {
-		address = fmt.Sprintf("%s:%d", ep.Host, ep.Port)
-	}
-
-	startTime := time.Now()
-
-	d := net.Dialer{
-		Timeout: m.monitorConfig.tcpTimeout,
-	}
-
-	conn, err := d.DialContext(ctx, "tcp", address)
+	conn, err := (&net.Dialer{Timeout: m.config.TCPTimeout}).DialContext(ctx, "tcp", ep.Address)
 	if err != nil {
-		if ctx.Err() != nil {
-			return false
-		}
-		slog.Warn("TCP connection failed",
-			"address", address,
-			"error", err)
 		return false
 	}
-	defer func() {
-		if cerr := conn.Close(); cerr != nil {
-			slog.Debug("failed to close TCP connection",
-				"address", address,
-				"error", cerr)
-		}
-	}()
-
-	duration := time.Since(startTime)
-	slog.Debug("TCP check successful",
-		"address", address,
-		"duration", duration.Round(time.Millisecond))
-
+	_ = conn.Close()
 	return true
 }
 
@@ -871,12 +628,8 @@ func (m *Monitor) performHTTPCheck(ctx context.Context, ep Endpoint) bool {
 		expectedStatus = http.StatusOK
 	}
 
-	startTime := time.Now()
 	req, err := http.NewRequestWithContext(ctx, method, ep.URL, nil)
 	if err != nil {
-		slog.Error("failed to create request",
-			"url", sanitizeURL(ep.URL),
-			"error", err)
 		return false
 	}
 
@@ -886,58 +639,24 @@ func (m *Monitor) performHTTPCheck(ctx context.Context, ep Endpoint) bool {
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
-		if ctx.Err() != nil {
-			return false
-		}
-		slog.Warn("request failed",
-			"url", sanitizeURL(ep.URL),
-			"error", err)
 		return false
 	}
 	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			slog.Warn("failed to close response body",
-				"url", sanitizeURL(ep.URL),
-				"error", cerr)
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			slog.Warn("failed to close response body", "error", closeErr)
 		}
 	}()
 
-	limited := io.LimitReader(resp.Body, m.monitorConfig.maxResponseBodySize)
-	written, err := io.Copy(io.Discard, limited)
-	if err != nil {
-		slog.Warn("failed to drain response body",
-			"url", sanitizeURL(ep.URL),
-			"error", err)
+	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, m.config.MaxResponseBodySize)); err != nil {
+		slog.Warn("failed to drain response body", "error", err)
 	}
 
-	if written >= m.monitorConfig.maxResponseBodySize {
-		slog.Debug("response body truncated",
-			"url", sanitizeURL(ep.URL),
-			"size", written,
-			"limit", m.monitorConfig.maxResponseBodySize)
-	}
-
-	if resp.StatusCode != expectedStatus {
-		slog.Warn("unexpected status",
-			"url", sanitizeURL(ep.URL),
-			"status", resp.StatusCode,
-			"expected", expectedStatus)
-		return false
-	}
-
-	duration := time.Since(startTime)
-	slog.Debug("HTTP check successful",
-		"url", sanitizeURL(ep.URL),
-		"status", resp.StatusCode,
-		"response_size", written,
-		"duration", duration.Round(time.Millisecond))
-	return true
+	return resp.StatusCode == expectedStatus
 }
 
 func (m *Monitor) updateState(identifier string, success bool) {
 	val, ok := m.states.Load(identifier)
 	if !ok {
-		slog.Error("state not found for identifier", "id", identifier)
 		return
 	}
 	state := val.(*ServiceState)
@@ -946,26 +665,19 @@ func (m *Monitor) updateState(identifier string, success bool) {
 	defer state.mu.Unlock()
 
 	now := time.Now()
-	state.lastCheckTime = now
 
 	if success {
-		wasDown := state.isDown
-		if wasDown {
-			event := &NotifyEvent{
+		if state.isDown {
+			select {
+			case m.notifyQueue <- &NotifyEvent{
 				endpoint:  identifier,
 				isDown:    false,
 				timestamp: now,
 				failTime:  state.firstFailTime,
-			}
-
-			select {
-			case m.notifyQueue <- event:
+			}:
 			case <-m.shutdown:
 			default:
-				slog.Warn("notification queue full, dropping recovery event",
-					"id", identifier)
 			}
-
 			state.isDown = false
 			state.consecutiveFails = 0
 			state.firstFailTime = time.Time{}
@@ -978,22 +690,17 @@ func (m *Monitor) updateState(identifier string, success bool) {
 			state.firstFailTime = now
 		}
 
-		if state.consecutiveFails >= m.monitorConfig.failureThreshold && !state.isDown {
+		if state.consecutiveFails >= m.config.FailureThreshold && !state.isDown {
 			state.isDown = true
-
-			event := &NotifyEvent{
+			select {
+			case m.notifyQueue <- &NotifyEvent{
 				endpoint:  identifier,
 				isDown:    true,
 				timestamp: now,
 				failTime:  state.firstFailTime,
-			}
-
-			select {
-			case m.notifyQueue <- event:
+			}:
 			case <-m.shutdown:
 			default:
-				slog.Warn("notification queue full, dropping failure event",
-					"id", identifier)
 			}
 		}
 	}
@@ -1002,18 +709,9 @@ func (m *Monitor) updateState(identifier string, success bool) {
 func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) {
 	defer m.wg.Done()
 
-	batch := make([]*NotifyEvent, 0, m.monitorConfig.maxBatchSize)
-	timer := time.NewTimer(m.monitorConfig.notifyBatchWindow)
+	var batch []*NotifyEvent
+	timer := time.NewTimer(m.config.NotifyBatchWindow)
 	timer.Stop()
-
-	defer func() {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-	}()
 
 	flush := func() {
 		if len(batch) == 0 {
@@ -1026,7 +724,6 @@ func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) 
 		}
 
 		m.sendBatchNotification(ctx, eventsCopy, notifiers)
-
 		batch = batch[:0]
 	}
 
@@ -1039,17 +736,11 @@ func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) 
 			}
 
 			batch = append(batch, event)
-
-			if len(batch) >= m.monitorConfig.maxBatchSize {
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
+			if len(batch) >= m.config.MaxBatchSize {
+				timer.Stop()
 				flush()
 			} else if len(batch) == 1 {
-				timer.Reset(m.monitorConfig.notifyBatchWindow)
+				timer.Reset(m.config.NotifyBatchWindow)
 			}
 
 		case <-timer.C:
@@ -1067,62 +758,40 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []NotifyEven
 		return
 	}
 
-	downServices := make([]string, 0, len(events))
-	upServices := make([]string, 0, len(events))
-	downDetails := make(map[string]time.Time, len(events))
-	upDetails := make(map[string]time.Time, len(events))
-
-	for i := range events {
-		e := &events[i]
-		if e.isDown {
-			downServices = append(downServices, e.endpoint)
-			downDetails[e.endpoint] = e.failTime
-		} else {
-			upServices = append(upServices, e.endpoint)
-			upDetails[e.endpoint] = e.failTime
-		}
-	}
-
-	estimatedSize := 150 + len(m.hostname)
-	if len(downServices) > 0 {
-		for _, svc := range downServices {
-			estimatedSize += len(svc) + 60
-		}
-	}
-	if len(upServices) > 0 {
-		for _, svc := range upServices {
-			estimatedSize += len(svc) + 70
-		}
-	}
-
 	var sb strings.Builder
-	sb.Grow(estimatedSize)
-
 	sb.WriteString("*Host:* `")
-	sb.WriteString(m.hostname)
+	sb.WriteString(m.config.Hostname)
 	sb.WriteString("`\n\n")
+
+	var downServices, upServices []NotifyEvent
+	for i := range events {
+		if events[i].isDown {
+			downServices = append(downServices, events[i])
+		} else {
+			upServices = append(upServices, events[i])
+		}
+	}
 
 	if len(downServices) > 0 {
 		sb.WriteString("*Services DOWN:*\n")
-		for _, svc := range downServices {
+		for _, e := range downServices {
 			sb.WriteString("- ")
-			sb.WriteString(svc)
+			sb.WriteString(e.endpoint)
 			sb.WriteString("\n  Failed at: ")
-			sb.WriteString(downDetails[svc].Format("2006-01-02 15:04:05"))
+			sb.WriteString(e.failTime.Format("2006-01-02 15:04:05"))
 			sb.WriteString("\n")
 		}
 	}
 
 	if len(upServices) > 0 {
-		if sb.Len() > len(m.hostname)+20 {
+		if len(downServices) > 0 {
 			sb.WriteString("\n")
 		}
 		sb.WriteString("*Services RECOVERED:*\n")
-		for _, svc := range upServices {
-			failTime := upDetails[svc]
-			duration := time.Since(failTime).Round(time.Second)
+		for _, e := range upServices {
+			duration := time.Since(e.failTime).Round(time.Second)
 			sb.WriteString("- ")
-			sb.WriteString(svc)
+			sb.WriteString(e.endpoint)
 			sb.WriteString("\n  Downtime: ")
 			sb.WriteString(duration.String())
 			sb.WriteString("\n")
@@ -1130,24 +799,17 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []NotifyEven
 	}
 
 	msg := sb.String()
-
 	notifyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	var lastErr error
 	for _, notifier := range notifiers {
 		if err := notifier.Send(notifyCtx, msg); err != nil {
-			lastErr = err
-			slog.Warn("notification failed",
-				"notifier", notifier.Name(),
-				"error", err)
+			slog.Warn("notification failed", "notifier", notifier.Name(), "error", err)
 			continue
 		}
 		slog.Info("notification sent", "notifier", notifier.Name())
 		return
 	}
 
-	if lastErr != nil {
-		slog.Error("failed to send notification through all channels", "last_error", lastErr)
-	}
+	slog.Error("all notifications failed")
 }
