@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/signal"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -151,7 +150,6 @@ type Monitor struct {
 func loadConfig() (*Config, error) {
 	cfg := &Config{}
 
-	// Load defaults using reflection
 	v := reflect.ValueOf(cfg).Elem()
 	t := v.Type()
 	for i := 0; i < t.NumField(); i++ {
@@ -198,7 +196,6 @@ func loadConfig() (*Config, error) {
 		}
 	}
 
-	// Load endpoints from YAML
 	data, err := os.ReadFile(cfg.ConfigPath)
 	if err != nil {
 		return nil, err
@@ -300,13 +297,8 @@ func createNotifiers(cfg *Config, client *http.Client) ([]Notifier, error) {
 				url:        cfg.SlackURL,
 				httpClient: client,
 				formatFunc: func(msg string) map[string]interface{} {
-					// Convert markdown to Slack's mrkdwn format
-					msg = strings.ReplaceAll(msg, "*", "*")
-					msg = strings.ReplaceAll(msg, "`", "`")
-					return map[string]interface{}{
-						"text":   msg,
-						"mrkdwn": true,
-					}
+					// Slack использует тот же markdown формат
+					return map[string]interface{}{"text": msg, "mrkdwn": true}
 				},
 			}, nil
 		},
@@ -319,9 +311,7 @@ func createNotifiers(cfg *Config, client *http.Client) ([]Notifier, error) {
 				url:        cfg.DiscordURL,
 				httpClient: client,
 				formatFunc: func(msg string) map[string]interface{} {
-					// Convert markdown to Discord format
-					msg = strings.ReplaceAll(msg, "*", "**")
-					return map[string]interface{}{"content": msg}
+					return map[string]interface{}{"content": strings.ReplaceAll(msg, "*", "**")}
 				},
 			}, nil
 		},
@@ -432,9 +422,6 @@ func main() {
 	monitor.wg.Add(1)
 	go monitor.notificationWorker(ctx, notifiers)
 
-	monitor.wg.Add(1)
-	go monitor.memoryMonitor(ctx)
-
 	ticker := time.NewTicker(cfg.CheckInterval)
 	defer ticker.Stop()
 
@@ -466,25 +453,6 @@ func main() {
 			}
 
 			transport.CloseIdleConnections()
-			return
-		}
-	}
-}
-
-func (m *Monitor) memoryMonitor(ctx context.Context) {
-	defer m.wg.Done()
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			var ms runtime.MemStats
-			runtime.ReadMemStats(&ms)
-			if ms.Alloc > 500*1024*1024 {
-				runtime.GC()
-			}
-		case <-ctx.Done():
 			return
 		}
 	}
@@ -541,74 +509,56 @@ func (m *Monitor) checkService(ctx context.Context, ep Endpoint) {
 func (m *Monitor) performCheck(ctx context.Context, ep Endpoint) bool {
 	switch ep.Type {
 	case "dns":
-		return m.performDNSCheck(ctx, ep)
+		return m.checkDNS(ctx, ep)
 	case "tcp":
-		return m.performTCPCheck(ctx, ep)
+		return m.checkTCP(ctx, ep)
 	default:
-		return m.performHTTPCheck(ctx, ep)
+		return m.checkHTTP(ctx, ep)
 	}
 }
 
-func (m *Monitor) performDNSCheck(ctx context.Context, ep Endpoint) bool {
+func (m *Monitor) checkDNS(ctx context.Context, ep Endpoint) bool {
 	dnsCtx, cancel := context.WithTimeout(ctx, m.config.DNSTimeout)
 	defer cancel()
 
 	var records []string
-	var err error
 
-	switch ep.RecordType {
-	case "A":
-		var ips []net.IPAddr
-		ips, err = m.resolver.LookupIPAddr(dnsCtx, ep.Host)
+	if ep.RecordType == "CNAME" {
+		cname, err := m.resolver.LookupCNAME(dnsCtx, ep.Host)
+		if err != nil {
+			return false
+		}
+		records = []string{strings.TrimSuffix(cname, ".")}
+	} else {
+		ips, err := m.resolver.LookupIPAddr(dnsCtx, ep.Host)
+		if err != nil {
+			return false
+		}
 		for _, ip := range ips {
-			if ip.IP.To4() != nil {
+			if ep.RecordType == "A" && ip.IP.To4() != nil {
+				records = append(records, ip.IP.String())
+			} else if ep.RecordType == "AAAA" && ip.IP.To4() == nil && ip.IP.To16() != nil {
 				records = append(records, ip.IP.String())
 			}
 		}
-		if len(records) == 0 && err == nil {
-			err = errors.New("no IPv4 found")
-		}
-
-	case "AAAA":
-		var ips []net.IPAddr
-		ips, err = m.resolver.LookupIPAddr(dnsCtx, ep.Host)
-		for _, ip := range ips {
-			if ip.IP.To4() == nil && ip.IP.To16() != nil {
-				records = append(records, ip.IP.String())
-			}
-		}
-		if len(records) == 0 && err == nil {
-			err = errors.New("no IPv6 found")
-		}
-
-	case "CNAME":
-		var cname string
-		cname, err = m.resolver.LookupCNAME(dnsCtx, ep.Host)
-		if err == nil {
-			records = []string{strings.TrimSuffix(cname, ".")}
+		if len(records) == 0 {
+			return false
 		}
 	}
 
-	if err != nil {
-		return false
-	}
-
-	// Validate expected value if provided
 	if ep.Expected != "" {
-		found := false
 		for _, record := range records {
 			if record == ep.Expected {
-				found = true
-				break
+				return true
 			}
 		}
-		return found
+		return false
 	}
 
 	return true
 }
 
-func (m *Monitor) performTCPCheck(ctx context.Context, ep Endpoint) bool {
+func (m *Monitor) checkTCP(ctx context.Context, ep Endpoint) bool {
 	conn, err := (&net.Dialer{Timeout: m.config.TCPTimeout}).DialContext(ctx, "tcp", ep.Address)
 	if err != nil {
 		return false
@@ -617,7 +567,7 @@ func (m *Monitor) performTCPCheck(ctx context.Context, ep Endpoint) bool {
 	return true
 }
 
-func (m *Monitor) performHTTPCheck(ctx context.Context, ep Endpoint) bool {
+func (m *Monitor) checkHTTP(ctx context.Context, ep Endpoint) bool {
 	method := ep.Method
 	if method == "" {
 		method = http.MethodGet
