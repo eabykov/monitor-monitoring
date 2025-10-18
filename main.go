@@ -297,7 +297,6 @@ func createNotifiers(cfg *Config, client *http.Client) ([]Notifier, error) {
 				url:        cfg.SlackURL,
 				httpClient: client,
 				formatFunc: func(msg string) map[string]interface{} {
-					// Slack использует тот же markdown формат
 					return map[string]interface{}{"text": msg, "mrkdwn": true}
 				},
 			}, nil
