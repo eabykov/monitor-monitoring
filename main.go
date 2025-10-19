@@ -89,17 +89,15 @@ type NotifyEvent struct {
 	failTime  time.Time
 }
 
-// Pool для переиспользования NotifyEvent объектов
 var notifyEventPool = sync.Pool{
 	New: func() interface{} {
 		return &NotifyEvent{}
 	},
 }
 
-// Pool для буферов io.Copy
 var copyBufferPool = sync.Pool{
 	New: func() interface{} {
-		buf := make([]byte, 32*1024) // 32KB буфер
+		buf := make([]byte, 32*1024)
 		return &buf
 	},
 }
@@ -139,7 +137,6 @@ func (w *WebhookNotifier) Send(ctx context.Context, message string) error {
 		}
 	}()
 
-	// Используем буфер из pool для эффективного дренирования
 	bufPtr := copyBufferPool.Get().(*[]byte)
 	defer copyBufferPool.Put(bufPtr)
 
@@ -393,7 +390,6 @@ func main() {
 		"primary_notifier", cfg.PrimaryNotifier,
 		"fallback_notifier", cfg.FallbackNotifier)
 
-	// Оптимизированные настройки HTTP Transport
 	transport := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 10,
@@ -543,7 +539,6 @@ func (m *Monitor) checkDNS(ctx context.Context, ep Endpoint) bool {
 	dnsCtx, cancel := context.WithTimeout(ctx, m.config.DNSTimeout)
 	defer cancel()
 
-	// Предварительно выделяем буфер на стеке для большинства случаев
 	recordsBuf := make([]string, 0, 8)
 
 	if ep.RecordType == "CNAME" {
@@ -620,7 +615,6 @@ func (m *Monitor) checkHTTP(ctx context.Context, ep Endpoint) bool {
 		}
 	}()
 
-	// Используем буфер из pool для эффективного дренирования
 	bufPtr := copyBufferPool.Get().(*[]byte)
 	defer copyBufferPool.Put(bufPtr)
 
@@ -645,7 +639,6 @@ func (m *Monitor) updateState(identifier string, success bool) {
 
 	if success {
 		if state.isDown {
-			// Получаем событие из pool
 			event := notifyEventPool.Get().(*NotifyEvent)
 			event.endpoint = identifier
 			event.isDown = false
@@ -655,10 +648,8 @@ func (m *Monitor) updateState(identifier string, success bool) {
 			select {
 			case m.notifyQueue <- event:
 			case <-m.shutdown:
-				// Возвращаем в pool если не удалось отправить
 				notifyEventPool.Put(event)
 			default:
-				// Возвращаем в pool если очередь заполнена
 				notifyEventPool.Put(event)
 			}
 			state.isDown = false
@@ -676,7 +667,6 @@ func (m *Monitor) updateState(identifier string, success bool) {
 		if state.consecutiveFails >= m.config.FailureThreshold && !state.isDown {
 			state.isDown = true
 
-			// Получаем событие из pool
 			event := notifyEventPool.Get().(*NotifyEvent)
 			event.endpoint = identifier
 			event.isDown = true
@@ -686,10 +676,8 @@ func (m *Monitor) updateState(identifier string, success bool) {
 			select {
 			case m.notifyQueue <- event:
 			case <-m.shutdown:
-				// Возвращаем в pool если не удалось отправить
 				notifyEventPool.Put(event)
 			default:
-				// Возвращаем в pool если очередь заполнена
 				notifyEventPool.Put(event)
 			}
 		}
@@ -711,7 +699,6 @@ func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) 
 		eventsCopy := make([]NotifyEvent, len(batch))
 		for i, event := range batch {
 			eventsCopy[i] = *event
-			// Возвращаем события в pool после копирования
 			notifyEventPool.Put(event)
 		}
 
@@ -751,7 +738,6 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []NotifyEven
 	}
 
 	var sb strings.Builder
-	// Предварительное выделение буфера для уменьшения реаллокаций
 	sb.Grow(512)
 
 	sb.WriteString("*Host:* `")
