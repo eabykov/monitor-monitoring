@@ -89,6 +89,21 @@ type NotifyEvent struct {
 	failTime  time.Time
 }
 
+// Pool для переиспользования NotifyEvent объектов
+var notifyEventPool = sync.Pool{
+	New: func() interface{} {
+		return &NotifyEvent{}
+	},
+}
+
+// Pool для буферов io.Copy
+var copyBufferPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 32*1024) // 32KB буфер
+		return &buf
+	},
+}
+
 type Notifier interface {
 	Send(ctx context.Context, message string) error
 	Name() string
@@ -124,7 +139,11 @@ func (w *WebhookNotifier) Send(ctx context.Context, message string) error {
 		}
 	}()
 
-	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20)); err != nil {
+	// Используем буфер из pool для эффективного дренирования
+	bufPtr := copyBufferPool.Get().(*[]byte)
+	defer copyBufferPool.Put(bufPtr)
+
+	if _, err := io.CopyBuffer(io.Discard, io.LimitReader(resp.Body, 1<<20), *bufPtr); err != nil {
 		slog.Warn("failed to drain response body", "error", err)
 	}
 
@@ -374,10 +393,14 @@ func main() {
 		"primary_notifier", cfg.PrimaryNotifier,
 		"fallback_notifier", cfg.FallbackNotifier)
 
+	// Оптимизированные настройки HTTP Transport
 	transport := &http.Transport{
-		MaxIdleConns:        20,
-		MaxIdleConnsPerHost: 2,
-		IdleConnTimeout:     30 * time.Second,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true,
+		ForceAttemptHTTP2:   true,
+		MaxConnsPerHost:     0,
 		DialContext: (&net.Dialer{
 			Timeout:   cfg.TCPTimeout,
 			KeepAlive: 30 * time.Second,
@@ -520,14 +543,15 @@ func (m *Monitor) checkDNS(ctx context.Context, ep Endpoint) bool {
 	dnsCtx, cancel := context.WithTimeout(ctx, m.config.DNSTimeout)
 	defer cancel()
 
-	var records []string
+	// Предварительно выделяем буфер на стеке для большинства случаев
+	recordsBuf := make([]string, 0, 8)
 
 	if ep.RecordType == "CNAME" {
 		cname, err := m.resolver.LookupCNAME(dnsCtx, ep.Host)
 		if err != nil {
 			return false
 		}
-		records = []string{strings.TrimSuffix(cname, ".")}
+		recordsBuf = append(recordsBuf, strings.TrimSuffix(cname, "."))
 	} else {
 		ips, err := m.resolver.LookupIPAddr(dnsCtx, ep.Host)
 		if err != nil {
@@ -535,18 +559,18 @@ func (m *Monitor) checkDNS(ctx context.Context, ep Endpoint) bool {
 		}
 		for _, ip := range ips {
 			if ep.RecordType == "A" && ip.IP.To4() != nil {
-				records = append(records, ip.IP.String())
+				recordsBuf = append(recordsBuf, ip.IP.String())
 			} else if ep.RecordType == "AAAA" && ip.IP.To4() == nil && ip.IP.To16() != nil {
-				records = append(records, ip.IP.String())
+				recordsBuf = append(recordsBuf, ip.IP.String())
 			}
 		}
-		if len(records) == 0 {
+		if len(recordsBuf) == 0 {
 			return false
 		}
 	}
 
 	if ep.Expected != "" {
-		for _, record := range records {
+		for _, record := range recordsBuf {
 			if record == ep.Expected {
 				return true
 			}
@@ -596,7 +620,11 @@ func (m *Monitor) checkHTTP(ctx context.Context, ep Endpoint) bool {
 		}
 	}()
 
-	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, m.config.MaxResponseBodySize)); err != nil {
+	// Используем буфер из pool для эффективного дренирования
+	bufPtr := copyBufferPool.Get().(*[]byte)
+	defer copyBufferPool.Put(bufPtr)
+
+	if _, err := io.CopyBuffer(io.Discard, io.LimitReader(resp.Body, m.config.MaxResponseBodySize), *bufPtr); err != nil {
 		slog.Warn("failed to drain response body", "error", err)
 	}
 
@@ -617,15 +645,21 @@ func (m *Monitor) updateState(identifier string, success bool) {
 
 	if success {
 		if state.isDown {
+			// Получаем событие из pool
+			event := notifyEventPool.Get().(*NotifyEvent)
+			event.endpoint = identifier
+			event.isDown = false
+			event.timestamp = now
+			event.failTime = state.firstFailTime
+
 			select {
-			case m.notifyQueue <- &NotifyEvent{
-				endpoint:  identifier,
-				isDown:    false,
-				timestamp: now,
-				failTime:  state.firstFailTime,
-			}:
+			case m.notifyQueue <- event:
 			case <-m.shutdown:
+				// Возвращаем в pool если не удалось отправить
+				notifyEventPool.Put(event)
 			default:
+				// Возвращаем в pool если очередь заполнена
+				notifyEventPool.Put(event)
 			}
 			state.isDown = false
 			state.consecutiveFails = 0
@@ -641,15 +675,22 @@ func (m *Monitor) updateState(identifier string, success bool) {
 
 		if state.consecutiveFails >= m.config.FailureThreshold && !state.isDown {
 			state.isDown = true
+
+			// Получаем событие из pool
+			event := notifyEventPool.Get().(*NotifyEvent)
+			event.endpoint = identifier
+			event.isDown = true
+			event.timestamp = now
+			event.failTime = state.firstFailTime
+
 			select {
-			case m.notifyQueue <- &NotifyEvent{
-				endpoint:  identifier,
-				isDown:    true,
-				timestamp: now,
-				failTime:  state.firstFailTime,
-			}:
+			case m.notifyQueue <- event:
 			case <-m.shutdown:
+				// Возвращаем в pool если не удалось отправить
+				notifyEventPool.Put(event)
 			default:
+				// Возвращаем в pool если очередь заполнена
+				notifyEventPool.Put(event)
 			}
 		}
 	}
@@ -670,6 +711,8 @@ func (m *Monitor) notificationWorker(ctx context.Context, notifiers []Notifier) 
 		eventsCopy := make([]NotifyEvent, len(batch))
 		for i, event := range batch {
 			eventsCopy[i] = *event
+			// Возвращаем события в pool после копирования
+			notifyEventPool.Put(event)
 		}
 
 		m.sendBatchNotification(ctx, eventsCopy, notifiers)
@@ -708,6 +751,9 @@ func (m *Monitor) sendBatchNotification(ctx context.Context, events []NotifyEven
 	}
 
 	var sb strings.Builder
+	// Предварительное выделение буфера для уменьшения реаллокаций
+	sb.Grow(512)
+
 	sb.WriteString("*Host:* `")
 	sb.WriteString(m.config.Hostname)
 	sb.WriteString("`\n\n")
