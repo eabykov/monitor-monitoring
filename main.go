@@ -44,9 +44,6 @@ type Config struct {
 	MattermostURL  string `env:"MATTERMOST_WEBHOOK_URL"`
 	SlackURL       string `env:"SLACK_WEBHOOK_URL"`
 	DiscordURL     string `env:"DISCORD_WEBHOOK_URL"`
-	MaxToken       string `env:"MAX_BOT_TOKEN"`
-	MaxChatID      string `env:"MAX_CHAT_ID"`
-	MaxUserID      string `env:"MAX_USER_ID"`
 
 	Endpoints []Endpoint `yaml:"endpoints"`
 }
@@ -333,33 +330,6 @@ func createNotifiers(cfg *Config, client *http.Client) ([]Notifier, error) {
 				},
 			}, nil
 		},
-		"max": func() (Notifier, error) {
-			if cfg.MaxToken == "" {
-				return nil, errors.New("max bot token missing")
-			}
-			if cfg.MaxChatID == "" && cfg.MaxUserID == "" {
-				return nil, errors.New("max chat_id or user_id required")
-			}
-			
-			baseURL := fmt.Sprintf("https://platform-api.max.ru/messages?access_token=%s", cfg.MaxToken)
-			if cfg.MaxChatID != "" {
-				baseURL += fmt.Sprintf("&chat_id=%s", cfg.MaxChatID)
-			} else {
-				baseURL += fmt.Sprintf("&user_id=%s", cfg.MaxUserID)
-			}
-			
-			return &WebhookNotifier{
-				name:       "MAX",
-				url:        baseURL,
-				httpClient: client,
-				formatFunc: func(msg string) map[string]interface{} {
-					return map[string]interface{}{
-						"text":   msg,
-						"format": "markdown",
-					}
-				},
-			}, nil
-		},
 	}
 
 	var notifiers []Notifier
@@ -392,6 +362,7 @@ func createNotifiers(cfg *Config, client *http.Client) ([]Notifier, error) {
 
 	return notifiers, nil
 }
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
