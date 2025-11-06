@@ -161,6 +161,7 @@ type Monitor struct {
 	semaphore   chan struct{}
 	wg          sync.WaitGroup
 	shutdown    chan struct{}
+	startTime   time.Time
 }
 
 func loadConfig() (*Config, error) {
@@ -363,6 +364,54 @@ func createNotifiers(cfg *Config, client *http.Client) ([]Notifier, error) {
 	return notifiers, nil
 }
 
+func (m *Monitor) sendLifecycleNotification(ctx context.Context, notifiers []Notifier, isStartup bool) {
+	var sb strings.Builder
+	sb.Grow(256)
+
+	sb.WriteString("*Host:* `")
+	sb.WriteString(m.config.Hostname)
+	sb.WriteString("`\n")
+
+	if isStartup {
+		sb.WriteString("*Status:* 🟢 STARTED\n")
+		sb.WriteString("*Monitoring:* ")
+		sb.WriteString(fmt.Sprintf("%d endpoint", len(m.config.Endpoints)))
+		if len(m.config.Endpoints) != 1 {
+			sb.WriteString("s")
+		}
+		sb.WriteString("\n*Check Interval:* ")
+		sb.WriteString(m.config.CheckInterval.String())
+		sb.WriteString("\n*Time:* ")
+		sb.WriteString(time.Now().Format("2006-01-02 15:04:05"))
+	} else {
+		sb.WriteString("*Status:* 🔴 STOPPED\n")
+		if !m.startTime.IsZero() {
+			uptime := time.Since(m.startTime).Round(time.Second)
+			sb.WriteString("*Uptime:* ")
+			sb.WriteString(uptime.String())
+			sb.WriteString("\n")
+		}
+		sb.WriteString("*Time:* ")
+		sb.WriteString(time.Now().Format("2006-01-02 15:04:05"))
+	}
+
+	msg := sb.String()
+
+	notifyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	for _, notifier := range notifiers {
+		if err := notifier.Send(notifyCtx, msg); err != nil {
+			slog.Warn("lifecycle notification failed", "notifier", notifier.Name(), "type", map[bool]string{true: "startup", false: "shutdown"}[isStartup], "error", err)
+			continue
+		}
+		slog.Info("lifecycle notification sent", "notifier", notifier.Name(), "type", map[bool]string{true: "startup", false: "shutdown"}[isStartup])
+		return
+	}
+
+	slog.Warn("all lifecycle notifications failed", "type", map[bool]string{true: "startup", false: "shutdown"}[isStartup])
+}
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
@@ -428,6 +477,7 @@ func main() {
 		notifyQueue: make(chan *NotifyEvent, 100),
 		semaphore:   make(chan struct{}, cfg.MaxConcurrentChecks),
 		shutdown:    make(chan struct{}),
+		startTime:   time.Now(),
 	}
 
 	for _, ep := range cfg.Endpoints {
@@ -436,6 +486,8 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	go monitor.sendLifecycleNotification(ctx, notifiers, true)
 
 	monitor.wg.Add(1)
 	go monitor.notificationWorker(ctx, notifiers)
@@ -450,6 +502,12 @@ func main() {
 		case <-ticker.C:
 			monitor.checkAllServices(ctx)
 		case <-ctx.Done():
+			slog.Info("shutdown signal received")
+
+			shutdownNotifyCtx, shutdownNotifyCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			monitor.sendLifecycleNotification(shutdownNotifyCtx, notifiers, false)
+			shutdownNotifyCancel()
+
 			close(monitor.shutdown)
 			ticker.Stop()
 
